@@ -1,11 +1,14 @@
+import asyncio
+import logging
+import time
+import hashlib
+from typing import Dict, Set, Optional
+from websockets.server import WebSocketServerProtocol
+
 """
 Модуль безопасности для проверки подлинности узлов, защиты от атак и валидации сообщений
 """
 
-import time
-import logging
-import hashlib
-import asyncio
 from typing import Dict, Optional, Tuple, Set, List
 from dataclasses import dataclass
 from src.crypto import CryptoManager
@@ -24,6 +27,8 @@ class SecurityConfig:
     min_reputation: float = 0.5
     reputation_decay: float = 0.1
     sybil_threshold: int = 3
+    initial_reputation: float = 0.5
+    max_reputation: float = 1.0
 
 class SecurityManager:
     """Менеджер безопасности"""
@@ -48,6 +53,13 @@ class SecurityManager:
         self.blocked_nodes: Set[str] = set()
         self.sybil_nodes: Set[str] = set()
         self.cleanup_task = None
+        self.logger = logging.getLogger(__name__)
+        self._known_peers: Set[str] = set()
+        self._active_challenges: Dict[str, float] = {}
+        self._reputation: Dict[str, float] = {}
+        self._last_reputation_update: Dict[str, float] = {}
+        self.reputations: Dict[str, float] = {}
+        self.blocked_peers: Set[str] = set()
         
     async def init(self):
         """Инициализирует асинхронные ресурсы"""
@@ -184,25 +196,33 @@ class SecurityManager:
         # Округляем до 1.0 если очень близко к 1.0
         return 1.0 if reputation > 0.9999 else reputation
 
-    async def update_reputation(self, node_id: str, success: bool):
-        """Обновляет репутацию узла"""
-        delta = 0.1 if success else -0.2
-        current_reputation = self.get_node_reputation(node_id)
-        new_reputation = max(
-            self.config.min_reputation,
-            min(1.0, current_reputation + delta)  # Ограничиваем максимальную репутацию
-        )
-        self.node_reputation[node_id] = new_reputation
-        self.last_reputation_update[node_id] = time.time()
+    async def update_reputation(self, peer_id: str, success: bool):
+        """Обновляет репутацию пира
         
-        logger.debug(f"Updating reputation for {node_id}: {current_reputation} -> {new_reputation} (success={success})")
-        
-        # Если репутация улучшилась и стала выше минимальной, убираем из Sybil-узлов
-        if success and new_reputation > self.config.min_reputation and node_id in self.sybil_nodes:
-            logger.debug(f"Removing {node_id} from Sybil nodes due to improved reputation")
-            self.sybil_nodes.remove(node_id)
-            if node_id in self.connections:
-                self.connections[node_id] = []
+        Args:
+            peer_id: Идентификатор пира
+            success: Успешность взаимодействия
+        """
+        try:
+            current = self.reputations.get(peer_id, self.config.initial_reputation)
+            
+            if success:
+                # Увеличиваем репутацию при успешном взаимодействии
+                new_reputation = min(current + 0.1, self.config.max_reputation)
+            else:
+                # Уменьшаем репутацию при неудачном взаимодействии
+                new_reputation = max(current - self.config.reputation_decay, 0)
+                
+            self.reputations[peer_id] = new_reputation
+            
+            # Если репутация упала ниже минимума, блокируем пира
+            if new_reputation < self.config.min_reputation:
+                self.blocked_peers.add(peer_id)
+                logger.warning(f"Пир {peer_id} заблокирован из-за низкой репутации")
+                
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении репутации для {peer_id}: {e}")
+            # При ошибке не меняем репутацию
 
     async def block_node(self, node_id: str):
         """Блокирует узел"""
@@ -331,4 +351,121 @@ class SecurityManager:
             self.last_reputation_update[node_id] = current_time
             return False
             
-        return True 
+        return True
+
+    async def validate_connection(self, websocket: WebSocketServerProtocol) -> Optional[str]:
+        """Валидация входящего соединения."""
+        try:
+            # Получаем вызов от инициатора
+            challenge = await websocket.recv()
+            self.logger.debug(f"Получен вызов: {challenge}")
+            
+            # Генерируем ответ
+            response = hashlib.sha256(challenge.encode()).hexdigest()
+            self.logger.debug(f"Сгенерирован ответ: {response}")
+            
+            # Отправляем ответ
+            await websocket.send(response)
+            self.logger.debug("Ответ отправлен")
+            
+            # Получаем подтверждение
+            confirmation = await websocket.recv()
+            self.logger.debug(f"Получено подтверждение: {confirmation}")
+            
+            # Проверяем подтверждение
+            expected_confirmation = hashlib.sha256((challenge + "_confirmed").encode()).hexdigest()
+            if confirmation != expected_confirmation:
+                self.logger.warning("Неверное подтверждение вызова")
+                return None
+                
+            # Генерируем peer_id для нового соединения
+            peer_id = self._generate_peer_id()
+            self.logger.debug(f"Сгенерирован peer_id: {peer_id}")
+            
+            # Добавляем peer в список известных
+            self._known_peers.add(peer_id)
+            
+            # Обновляем репутацию
+            await self.update_reputation(peer_id, True)
+            
+            return peer_id
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при валидации соединения: {str(e)}", exc_info=True)
+            return None
+
+    async def validate_outgoing_connection(self, websocket) -> Optional[str]:
+        """Валидация исходящего соединения."""
+        try:
+            # Генерируем временный peer_id
+            temp_peer_id = self._generate_peer_id()
+            self.logger.debug(f"Сгенерирован временный peer_id: {temp_peer_id}")
+            
+            # Генерируем вызов
+            challenge = self._generate_challenge()
+            self.logger.debug(f"Сгенерирован вызов: {challenge}")
+            
+            # Отправляем вызов
+            await websocket.send(challenge)
+            self.logger.debug("Вызов отправлен")
+            
+            # Получаем ответ
+            self.logger.debug("Ожидание ответа на вызов...")
+            response = await websocket.recv()
+            self.logger.debug(f"Получен ответ: {response}")
+            
+            # Проверяем ответ
+            expected_response = hashlib.sha256(challenge.encode()).hexdigest()
+            if response != expected_response:
+                self.logger.warning("Неверный ответ на вызов")
+                return None
+                
+            # Отправляем подтверждение
+            confirmation = hashlib.sha256((challenge + "_confirmed").encode()).hexdigest()
+            await websocket.send(confirmation)
+            self.logger.debug("Подтверждение отправлено")
+            
+            # Добавляем peer в список известных
+            self._known_peers.add(temp_peer_id)
+            
+            # Обновляем репутацию
+            await self.update_reputation(temp_peer_id, True)
+            
+            return temp_peer_id
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при валидации соединения: {str(e)}", exc_info=True)
+            return None
+
+    def _generate_peer_id(self) -> str:
+        """Генерирует уникальный ID для пира."""
+        return hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+
+    def _generate_challenge(self) -> str:
+        """Генерирует вызов для проверки соединения."""
+        challenge = hashlib.sha256(str(time.time()).encode()).hexdigest()
+        self._active_challenges[challenge] = time.time()
+        return challenge
+
+    def _verify_challenge_response(self, challenge: str, response: str) -> bool:
+        """Проверяет ответ на вызов."""
+        if challenge not in self._active_challenges:
+            return False
+            
+        # Проверяем, что вызов не устарел (5 секунд)
+        if time.time() - self._active_challenges[challenge] > 5:
+            del self._active_challenges[challenge]
+            return False
+            
+        # Проверяем, что ответ - это хеш вызова
+        expected_response = hashlib.sha256(challenge.encode()).hexdigest()
+        is_valid = response == expected_response
+        
+        # Удаляем использованный вызов
+        del self._active_challenges[challenge]
+        
+        return is_valid
+
+    def _generate_challenge_confirmation(self, challenge: str) -> str:
+        """Генерирует подтверждение успешной проверки вызова."""
+        return hashlib.sha256((challenge + "_confirmed").encode()).hexdigest() 

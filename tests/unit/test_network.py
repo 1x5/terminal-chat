@@ -434,3 +434,4 @@ async def test_connection_cleanup(connection):
         await connection.connect()
         await connection.stop()
         mock_ws.close.assert_called_once()
+    await network3.stop() 

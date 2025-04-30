@@ -453,3 +453,4 @@ async def test_network_stats(discovery):
     assert stats["reputation_stats"]["high"] == 1
     assert stats["reputation_stats"]["medium"] == 1
     assert stats["reputation_stats"]["low"] == 1 
+ 

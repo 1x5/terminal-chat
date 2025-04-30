@@ -32,6 +32,13 @@ env/
 *.swp
 *.swo
 
+# Project specific
+.keys/
+*.pem
+*.key
+*.log
+peer_keys.json
+
 # Logs
 *.log
 

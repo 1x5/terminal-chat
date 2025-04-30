@@ -929,3 +929,4 @@ async def test_routing_performance_and_reliability(router):
         msg = await router.get_message(target)
         if msg is not None:
             assert msg.get("ttl") is None  # Остались только сообщения без TTL 
+ 

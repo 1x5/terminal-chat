@@ -472,25 +472,35 @@ class OnionRoutingManager:
         Инициализирует менеджер луковой маршрутизации
         
         Args:
-            config (Config): Конфигурация приложения
-            crypto (CryptoManager): Менеджер шифрования
-            network (Network): Сетевой модуль
+            config: Конфигурация приложения
+            crypto: Менеджер криптографии
+            network: Сетевой модуль
         """
         self.config = config
         self.crypto = crypto
         self.network = network
         self.circuits = {}  # circuit_id -> OnionCircuit
         self.message_handler = None
+        self.logger = logging.getLogger("securetermchat.onion_routing")
         self.next_circuit_id = 0
         
+    async def init(self):
+        """Инициализирует менеджер"""
+        # Регистрируем обработчик сообщений
+        self.network.set_message_handler(self._handle_message)
+        self.logger.info("OnionRoutingManager инициализирован")
+        
     async def start(self):
-        """Запускает менеджер луковой маршрутизации"""
+        """Запускает менеджер"""
         await self.network.start()
-        self.network.on_message = self._handle_message
         
     async def stop(self):
-        """Останавливает менеджер луковой маршрутизации"""
-        await self.network.stop()
+        """Останавливает менеджер"""
+        # Закрываем все цепочки
+        for circuit in self.circuits.values():
+            await circuit.teardown()
+        self.circuits.clear()
+        self.logger.info("OnionRoutingManager остановлен")
         
     async def create_circuit(self, route: List[Tuple[str, int]]) -> str:
         """

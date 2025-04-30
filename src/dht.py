@@ -525,3 +525,4 @@ class DHT:
         except Exception as e:
             logger.error(f"Ошибка при получении ближайших узлов к {target_id}: {e}")
             return [] 
+ 

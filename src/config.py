@@ -21,6 +21,53 @@ class Config:
     Класс управления конфигурацией приложения
     """
     
+    def __init__(self, config_path: Optional[str] = None):
+        """
+        Инициализация объекта конфигурации
+        
+        Args:
+            config_path (str): Путь к файлу конфигурации
+        """
+        self.config_path = config_path or os.path.expanduser("~/.securetermchat/config.json")
+        
+        # Получаем порт из переменной окружения или используем значение по умолчанию
+        default_port = int(os.environ.get('PORT', 8765))
+        
+        # Значения конфигурации по умолчанию
+        self.config = {
+            "node_id": None,  # Будет сгенерирован при первом запуске
+            "listen_host": "0.0.0.0",  # Слушаем на всех интерфейсах
+            "listen_port": default_port,  # Порт из переменной окружения или 8765
+            "bootstrap_nodes": [
+                "127.0.0.1:8765"  # Локальный узел для тестирования
+            ],
+            "data_dir": os.path.dirname(self.config_path),
+            "max_connections": 100,
+            "connection_timeout": 30,
+            "max_message_size": 1024 * 1024,  # 1MB
+            "challenge_timeout": 30.0,
+            "min_reputation": 0.5,
+            "reputation_decay": 0.1,
+            "max_reputation": 1.0,
+            "initial_reputation": 1.0,
+            "reputation_update_interval": 60,
+            "min_onion_nodes": 3,
+            "max_onion_nodes": 5,
+            "onion_timeout": 60,
+            "log_level": "INFO"
+        }
+        
+        # Ключи для шифрования
+        self.private_key = None
+        self.public_key = None
+        
+        # Список контактов
+        self.contacts = {}
+        
+        # Создаем директорию для данных если не существует
+        if not os.path.exists(self.config["data_dir"]):
+            os.makedirs(self.config["data_dir"])
+            
     @property
     def port(self) -> int:
         """Возвращает порт для прослушивания"""
@@ -31,43 +78,41 @@ class Config:
         """Возвращает директорию для данных"""
         return self.config["data_dir"]
         
-    def __init__(self, config_path: str = None):
-        """
-        Инициализация объекта конфигурации
+    @property
+    def max_connections(self) -> int:
+        return self.config["max_connections"]
         
-        Args:
-            config_path (str): Путь к файлу конфигурации
-        """
-        self.config_path = config_path or os.path.expanduser("~/.securetermchat/config.json")
+    @property
+    def connection_timeout(self) -> int:
+        return self.config["connection_timeout"]
         
-        # Значения конфигурации по умолчанию
-        self.config = {
-            "node_id": None,  # Будет сгенерирован при первом запуске
-            "listen_host": "127.0.0.1",  # Локальный хост для тестирования
-            "listen_port": 8765,  # Фиксированный порт для тестирования
-            "bootstrap_nodes": [
-                "127.0.0.1:8765"  # Локальный узел для тестирования
-            ],
-            "min_hops": 3,
-            "max_hops": 5,
-            "circuit_max_age": 3600,  # 1 час
-            "circuit_idle_timeout": 600,  # 10 минут
-            "circuit_max_traffic": 1024 * 1024,  # 1 МБ
-            "circuit_rotation_threshold": 0.8,  # 80% от максимума
-            "message_expiry": 86400,  # 24 часа
-            "dummy_traffic_interval": 60,  # 1 минута
-            "max_peers": 50,
-            "ui_refresh_rate": 0.1,  # Частота обновления UI в секундах
-            "log_level": "INFO",
-            "data_dir": None  # Будет установлен при загрузке
-        }
+    @property
+    def max_message_size(self) -> int:
+        return self.config["max_message_size"]
         
-        # Ключи для шифрования
-        self.private_key = None
-        self.public_key = None
+    @property
+    def challenge_timeout(self) -> float:
+        return self.config["challenge_timeout"]
         
-        # Список контактов
-        self.contacts = {}
+    @property
+    def min_reputation(self) -> float:
+        return self.config["min_reputation"]
+        
+    @property
+    def reputation_decay(self) -> float:
+        return self.config["reputation_decay"]
+        
+    @property
+    def max_reputation(self) -> float:
+        return self.config["max_reputation"]
+        
+    @property
+    def initial_reputation(self) -> float:
+        return self.config["initial_reputation"]
+        
+    @property
+    def reputation_update_interval(self) -> int:
+        return self.config["reputation_update_interval"]
         
     async def load(self):
         """Загружает конфигурацию и ключи из файлов"""
@@ -123,8 +168,8 @@ class Config:
         # Проверяем listen_port
         if not isinstance(self.config["listen_port"], int):
             errors.append("listen_port должен быть целым числом")
-        elif self.config["listen_port"] != 0 and not (1024 <= self.config["listen_port"] <= 65535):
-            errors.append("listen_port должен быть 0 (для автоматического выбора) или в диапазоне 1024-65535")
+        elif not (1024 <= self.config["listen_port"] <= 65535):
+            errors.append("listen_port должен быть в диапазоне 1024-65535")
             
         # Проверяем bootstrap_nodes
         if not isinstance(self.config["bootstrap_nodes"], list):

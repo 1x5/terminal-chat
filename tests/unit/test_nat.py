@@ -225,3 +225,4 @@ async def test_keep_alive(nat):
     # Проверяем что дырка все еще активна
     holes = await nat.get_holes()
     assert any(h["target_ip"] == target_ip and h["target_port"] == target_port for h in holes) 
+ 

@@ -1,453 +1,210 @@
 """
-Модуль для обхода NAT в P2P-сети
-
-Реализует механизмы определения типа NAT и установки соединений через STUN/TURN/ICE.
+Модуль для обхода NAT и установки P2P соединений
 """
 
 import asyncio
 import logging
 import socket
-import struct
-import random
+import json
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
-import aiohttp
+from dataclasses import dataclass
 import miniupnpc
-from stun import stun
+from .config import Config
 
-logger = logging.getLogger("securetermchat.nat_traversal")
+logger = logging.getLogger("securetermchat.nat")
 
-class NATType:
+class NATType(Enum):
     """Типы NAT"""
-    OPEN = "open"
-    FULL_CONE = "full_cone"
-    RESTRICTED = "restricted"
-    PORT_RESTRICTED = "port_restricted"
-    SYMMETRIC = "symmetric"
     UNKNOWN = "unknown"
+    OPEN = "open"
+    UPNP = "upnp"
+    BLOCKED = "blocked"
+
+@dataclass
+class ConnectionInfo:
+    """Информация о соединении"""
+    ip: str
+    port: int
+    nat_type: NATType
 
 class NATTraversal:
-    """Класс для обхода NAT"""
+    """
+    Реализует механизмы для обхода NAT:
+    - UPnP для проброса портов
+    - Прямые соединения
+    """
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
         """
-        Инициализирует модуль обхода NAT
+        Инициализация
         
         Args:
-            config: Объект конфигурации
+            config: Конфигурация
         """
         self.config = config
-        self.stun_servers = config.get("stun_servers", [
-            "stun.l.google.com:19302",
-            "stun1.l.google.com:19302",
-            "stun2.l.google.com:19302"
-        ])
-        self.turn_servers = config.get("turn_servers", [])
         self.nat_type = NATType.UNKNOWN
-        self.public_ip = None
-        self.public_port = None
         self.upnp = None
-        self.ice_agent = None
+        self.local_ip = None
+        self.local_port = None
+        self.external_ip = None
+        self.external_port = None
+        self.connections: Dict[str, ConnectionInfo] = {}
         
     async def init(self):
-        """Инициализирует модуль"""
-        try:
-            # Определяем тип NAT
-            await self.detect_nat_type()
-            
-            # Настраиваем UPnP если нужно
-            if self.nat_type != NATType.OPEN:
-                await self.setup_upnp()
-                
-            # Настраиваем ICE если нужно
-            if self.nat_type in [NATType.RESTRICTED, NATType.PORT_RESTRICTED, NATType.SYMMETRIC]:
-                await self.setup_ice()
-                
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации NAT traversal: {e}")
-            raise
-            
-    async def detect_nat_type(self):
-        """Определяет тип NAT через STUN"""
-        for stun_server in self.stun_servers:
-            try:
-                host, port = stun_server.split(":")
-                nat_type, external_ip, external_port = stun.get_nat_type(
-                    host=host,
-                    port=int(port),
-                    source_ip="0.0.0.0",
-                    source_port=0
-                )
-                
-                if nat_type:
-                    self.nat_type = nat_type
-                    self.public_ip = external_ip
-                    self.public_port = external_port
-                    logger.info(f"Определен тип NAT: {nat_type}")
-                    logger.info(f"Публичный адрес: {external_ip}:{external_port}")
-                    return
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка при определении типа NAT через {stun_server}: {e}")
-                continue
-                
-        logger.warning("Не удалось определить тип NAT")
+        """Инициализация NAT traversal"""
+        # Определяем локальный IP и порт
+        self.local_ip = socket.gethostbyname(socket.gethostname())
+        self.local_port = self.config.get("port", 8000)
         
-    async def setup_upnp(self):
-        """Настраивает UPnP для проброса портов"""
+        # Пробуем настроить UPnP
+        if await self.setup_upnp():
+            self.nat_type = NATType.UPNP
+            self.external_ip = self.upnp.lanaddr
+            self.external_port = self.local_port
+        else:
+            # Проверяем доступность из интернета
+            if await self.check_direct_connection():
+                self.nat_type = NATType.OPEN
+                self.external_ip = self.local_ip
+                self.external_port = self.local_port
+            else:
+                self.nat_type = NATType.BLOCKED
+                
+        logger.info(f"NAT type: {self.nat_type}")
+        logger.info(f"Local: {self.local_ip}:{self.local_port}")
+        if self.external_ip:
+            logger.info(f"External: {self.external_ip}:{self.external_port}")
+            
+    async def setup_upnp(self) -> bool:
+        """
+        Настраивает UPnP для проброса портов
+        
+        Returns:
+            bool: True если UPnP настроен успешно
+        """
         try:
             self.upnp = miniupnpc.UPnP()
             self.upnp.discoverdelay = 200
-            self.upnp.discover()
+            
+            # Ищем UPnP устройства
+            devices = self.upnp.discover()
+            if devices == 0:
+                logger.warning("No UPnP devices found")
+                return False
+                
+            # Выбираем первое устройство
             self.upnp.selectigd()
             
             # Пробрасываем порт
-            local_port = self.config.get("port", 8000)
             self.upnp.addportmapping(
-                local_port, "TCP",
-                self.upnp.lanaddr, local_port,
-                "SecureTermChat", ""
+                self.local_port, 'TCP',
+                self.upnp.lanaddr, self.local_port,
+                'SecureTermChat', ''
+            )
+            logger.info(f"Port {self.local_port} forwarded via UPnP")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to setup UPnP: {e}")
+            self.upnp = None
+            return False
+            
+    async def check_direct_connection(self) -> bool:
+        """
+        Проверяет доступность из интернета
+        
+        Returns:
+            bool: True если порт доступен извне
+        """
+        try:
+            # Создаем тестовый сервер
+            server = await asyncio.start_server(
+                lambda r, w: None,
+                self.local_ip,
+                self.local_port
             )
             
-            logger.info(f"UPnP: проброшен порт {local_port}")
+            # Пробуем подключиться к себе через внешний IP
+            reader, writer = await asyncio.open_connection(
+                self.local_ip,
+                self.local_port
+            )
+            
+            writer.close()
+            await writer.wait_closed()
+            server.close()
+            await server.wait_closed()
+            
+            return True
             
         except Exception as e:
-            logger.error(f"Ошибка при настройке UPnP: {e}")
+            logger.debug(f"Direct connection test failed: {e}")
+            return False
             
-    async def setup_ice(self):
-        """Настраивает ICE для обхода NAT"""
-        try:
-            # Создаем ICE агент
-            self.ice_agent = {
-                "stun_servers": self.stun_servers,
-                "turn_servers": self.turn_servers,
-                "candidates": []
-            }
-            
-            # Собираем локальные кандидаты
-            local_candidates = await self._gather_local_candidates()
-            self.ice_agent["candidates"].extend(local_candidates)
-            
-            # Собираем STUN кандидаты
-            stun_candidates = await self._gather_stun_candidates()
-            self.ice_agent["candidates"].extend(stun_candidates)
-            
-            # Собираем TURN кандидаты если есть
-            if self.turn_servers:
-                turn_candidates = await self._gather_turn_candidates()
-                self.ice_agent["candidates"].extend(turn_candidates)
-                
-            logger.info(f"ICE: собрано {len(self.ice_agent['candidates'])} кандидатов")
-            
-        except Exception as e:
-            logger.error(f"Ошибка при настройке ICE: {e}")
-            
-    async def _gather_local_candidates(self) -> List[Dict]:
-        """Собирает локальные ICE кандидаты"""
-        candidates = []
+    def get_connection_info(self) -> Dict:
+        """
+        Возвращает информацию для установки соединения
         
-        # Добавляем локальный адрес
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            
-            candidates.append({
-                "type": "host",
-                "protocol": "udp",
-                "ip": local_ip,
-                "port": self.config.get("port", 8000),
-                "priority": 2122260223  # Максимальный приоритет для хоста
-            })
-        except Exception as e:
-            logger.warning(f"Ошибка при получении локального адреса: {e}")
-            
-        return candidates
-        
-    async def _gather_stun_candidates(self) -> List[Dict]:
-        """Собирает STUN ICE кандидаты"""
-        candidates = []
-        
-        for stun_server in self.stun_servers:
-            try:
-                host, port = stun_server.split(":")
-                nat_type, external_ip, external_port = stun.get_nat_type(
-                    host=host,
-                    port=int(port),
-                    source_ip="0.0.0.0",
-                    source_port=0
-                )
-                
-                if external_ip and external_port:
-                    candidates.append({
-                        "type": "srflx",
-                        "protocol": "udp",
-                        "ip": external_ip,
-                        "port": external_port,
-                        "priority": 16777215  # Приоритет для STUN
-                    })
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка при получении STUN кандидата от {stun_server}: {e}")
-                continue
-                
-        return candidates
-        
-    async def _gather_turn_candidates(self) -> List[Dict]:
-        """Собирает TURN ICE кандидаты"""
-        candidates = []
-        
-        for turn_server in self.turn_servers:
-            try:
-                # TODO: Реализовать получение TURN кандидатов
-                pass
-            except Exception as e:
-                logger.warning(f"Ошибка при получении TURN кандидата от {turn_server}: {e}")
-                continue
-                
-        return candidates
-        
-    async def get_connection_info(self) -> Dict:
-        """Возвращает информацию о соединении"""
+        Returns:
+            Dict: Информация о соединении
+        """
         return {
-            "nat_type": self.nat_type,
-            "public_ip": self.public_ip,
-            "public_port": self.public_port,
-            "ice_candidates": self.ice_agent["candidates"] if self.ice_agent else []
+            "nat_type": self.nat_type.value,
+            "ip": self.external_ip or self.local_ip,
+            "port": self.external_port or self.local_port
         }
         
-    async def cleanup(self):
-        """Очищает ресурсы"""
-        if self.upnp:
-            try:
-                local_port = self.config.get("port", 8000)
-                self.upnp.deleteportmapping(local_port, "TCP")
-                logger.info(f"UPnP: удален проброс порта {local_port}")
-            except Exception as e:
-                logger.error(f"Ошибка при очистке UPnP: {e}") 
-Модуль для обхода NAT в P2P-сети
-
-Реализует механизмы определения типа NAT и установки соединений через STUN/TURN/ICE.
-"""
-
-import asyncio
-import logging
-import socket
-import struct
-import random
-from typing import Dict, List, Optional, Tuple
-import aiohttp
-import miniupnpc
-from stun import stun
-
-logger = logging.getLogger("securetermchat.nat_traversal")
-
-class NATType:
-    """Типы NAT"""
-    OPEN = "open"
-    FULL_CONE = "full_cone"
-    RESTRICTED = "restricted"
-    PORT_RESTRICTED = "port_restricted"
-    SYMMETRIC = "symmetric"
-    UNKNOWN = "unknown"
-
-class NATTraversal:
-    """Класс для обхода NAT"""
-    
-    def __init__(self, config):
+    async def connect_to_peer(self, peer_id: str, peer_info: Dict) -> bool:
         """
-        Инициализирует модуль обхода NAT
+        Устанавливает соединение с пиром
         
         Args:
-            config: Объект конфигурации
+            peer_id: ID пира
+            peer_info: Информация о соединении пира
+            
+        Returns:
+            bool: True если соединение установлено
         """
-        self.config = config
-        self.stun_servers = config.get("stun_servers", [
-            "stun.l.google.com:19302",
-            "stun1.l.google.com:19302",
-            "stun2.l.google.com:19302"
-        ])
-        self.turn_servers = config.get("turn_servers", [])
-        self.nat_type = NATType.UNKNOWN
-        self.public_ip = None
-        self.public_port = None
-        self.upnp = None
-        self.ice_agent = None
-        
-    async def init(self):
-        """Инициализирует модуль"""
         try:
-            # Определяем тип NAT
-            await self.detect_nat_type()
+            # Создаем сокет
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
             
-            # Настраиваем UPnP если нужно
-            if self.nat_type != NATType.OPEN:
-                await self.setup_upnp()
-                
-            # Настраиваем ICE если нужно
-            if self.nat_type in [NATType.RESTRICTED, NATType.PORT_RESTRICTED, NATType.SYMMETRIC]:
-                await self.setup_ice()
-                
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации NAT traversal: {e}")
-            raise
+            # Пробуем подключиться
+            sock.connect((peer_info["ip"], peer_info["port"]))
+            sock.close()
             
-    async def detect_nat_type(self):
-        """Определяет тип NAT через STUN"""
-        for stun_server in self.stun_servers:
-            try:
-                host, port = stun_server.split(":")
-                nat_type, external_ip, external_port = stun.get_nat_type(
-                    host=host,
-                    port=int(port),
-                    source_ip="0.0.0.0",
-                    source_port=0
-                )
-                
-                if nat_type:
-                    self.nat_type = nat_type
-                    self.public_ip = external_ip
-                    self.public_port = external_port
-                    logger.info(f"Определен тип NAT: {nat_type}")
-                    logger.info(f"Публичный адрес: {external_ip}:{external_port}")
-                    return
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка при определении типа NAT через {stun_server}: {e}")
-                continue
-                
-        logger.warning("Не удалось определить тип NAT")
-        
-    async def setup_upnp(self):
-        """Настраивает UPnP для проброса портов"""
-        try:
-            self.upnp = miniupnpc.UPnP()
-            self.upnp.discoverdelay = 200
-            self.upnp.discover()
-            self.upnp.selectigd()
-            
-            # Пробрасываем порт
-            local_port = self.config.get("port", 8000)
-            self.upnp.addportmapping(
-                local_port, "TCP",
-                self.upnp.lanaddr, local_port,
-                "SecureTermChat", ""
+            # Сохраняем информацию о соединении
+            self.connections[peer_id] = ConnectionInfo(
+                ip=peer_info["ip"],
+                port=peer_info["port"],
+                nat_type=NATType(peer_info["nat_type"])
             )
             
-            logger.info(f"UPnP: проброшен порт {local_port}")
+            return True
             
         except Exception as e:
-            logger.error(f"Ошибка при настройке UPnP: {e}")
+            logger.warning(f"Failed to connect to peer {peer_id}: {e}")
+            return False
             
-    async def setup_ice(self):
-        """Настраивает ICE для обхода NAT"""
-        try:
-            # Создаем ICE агент
-            self.ice_agent = {
-                "stun_servers": self.stun_servers,
-                "turn_servers": self.turn_servers,
-                "candidates": []
-            }
-            
-            # Собираем локальные кандидаты
-            local_candidates = await self._gather_local_candidates()
-            self.ice_agent["candidates"].extend(local_candidates)
-            
-            # Собираем STUN кандидаты
-            stun_candidates = await self._gather_stun_candidates()
-            self.ice_agent["candidates"].extend(stun_candidates)
-            
-            # Собираем TURN кандидаты если есть
-            if self.turn_servers:
-                turn_candidates = await self._gather_turn_candidates()
-                self.ice_agent["candidates"].extend(turn_candidates)
-                
-            logger.info(f"ICE: собрано {len(self.ice_agent['candidates'])} кандидатов")
-            
-        except Exception as e:
-            logger.error(f"Ошибка при настройке ICE: {e}")
-            
-    async def _gather_local_candidates(self) -> List[Dict]:
-        """Собирает локальные ICE кандидаты"""
-        candidates = []
-        
-        # Добавляем локальный адрес
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            
-            candidates.append({
-                "type": "host",
-                "protocol": "udp",
-                "ip": local_ip,
-                "port": self.config.get("port", 8000),
-                "priority": 2122260223  # Максимальный приоритет для хоста
-            })
-        except Exception as e:
-            logger.warning(f"Ошибка при получении локального адреса: {e}")
-            
-        return candidates
-        
-    async def _gather_stun_candidates(self) -> List[Dict]:
-        """Собирает STUN ICE кандидаты"""
-        candidates = []
-        
-        for stun_server in self.stun_servers:
-            try:
-                host, port = stun_server.split(":")
-                nat_type, external_ip, external_port = stun.get_nat_type(
-                    host=host,
-                    port=int(port),
-                    source_ip="0.0.0.0",
-                    source_port=0
-                )
-                
-                if external_ip and external_port:
-                    candidates.append({
-                        "type": "srflx",
-                        "protocol": "udp",
-                        "ip": external_ip,
-                        "port": external_port,
-                        "priority": 16777215  # Приоритет для STUN
-                    })
-                    
-            except Exception as e:
-                logger.warning(f"Ошибка при получении STUN кандидата от {stun_server}: {e}")
-                continue
-                
-        return candidates
-        
-    async def _gather_turn_candidates(self) -> List[Dict]:
-        """Собирает TURN ICE кандидаты"""
-        candidates = []
-        
-        for turn_server in self.turn_servers:
-            try:
-                # TODO: Реализовать получение TURN кандидатов
-                pass
-            except Exception as e:
-                logger.warning(f"Ошибка при получении TURN кандидата от {turn_server}: {e}")
-                continue
-                
-        return candidates
-        
-    async def get_connection_info(self) -> Dict:
-        """Возвращает информацию о соединении"""
-        return {
-            "nat_type": self.nat_type,
-            "public_ip": self.public_ip,
-            "public_port": self.public_port,
-            "ice_candidates": self.ice_agent["candidates"] if self.ice_agent else []
-        }
-        
     async def cleanup(self):
-        """Очищает ресурсы"""
+        """Очистка ресурсов"""
         if self.upnp:
             try:
-                local_port = self.config.get("port", 8000)
-                self.upnp.deleteportmapping(local_port, "TCP")
-                logger.info(f"UPnP: удален проброс порта {local_port}")
+                # Удаляем проброс порта
+                self.upnp.deleteportmapping(self.local_port, 'TCP')
+                logger.info(f"UPnP port mapping removed for port {self.local_port}")
             except Exception as e:
-                logger.error(f"Ошибка при очистке UPnP: {e}") 
+                logger.warning(f"Failed to remove UPnP mapping: {e}")
+                
+    async def _cleanup_connection(self, peer_id: str):
+        """
+        Очищает ресурсы соединения
+        
+        Args:
+            peer_id: ID пира
+        """
+        if peer_id in self.connections:
+            del self.connections[peer_id]
+ 

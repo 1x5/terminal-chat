@@ -430,3 +430,4 @@ async def test_key_rotation_interval(crypto_manager):
     
     # Cleanup
     await crypto_manager.stop() 
+    assert unwrapped == message 

@@ -19,6 +19,7 @@ from websockets.exceptions import (
 )
 from websockets.client import WebSocketClientProtocol
 from websockets.server import WebSocketServerProtocol
+from datetime import datetime
 
 from src.p2p_connection import NodeConnection
 from src.protocol import (
@@ -28,9 +29,11 @@ from src.protocol import (
 )
 from src.crypto import CryptoManager
 from src.security import SecurityManager
-from .e2e_encryption import E2EEncryption, E2EEncryptionError
+from .e2e_encryption import E2EEncryption, E2EEncryptionError, KeyLoadError
 from .signatures import MessageSigner, SignatureVerificationError
 from .reputation import ReputationManager, ReputationEvent
+from .nat_traversal import NATTraversal
+from .config import Config
 
 logger = logging.getLogger("securetermchat.network")
 
@@ -47,223 +50,319 @@ class MessageError(NetworkError):
     pass
 
 class P2PConnection:
-    """Represents a P2P connection with another node"""
+    """Представляет P2P соединение с удаленным узлом"""
     
     def __init__(self, websocket: WebSocketServerProtocol, peer_id: str):
+        """Инициализирует P2P соединение
+        
+        Args:
+            websocket: WebSocket соединение
+            peer_id: Идентификатор удаленного узла
+        """
         self.websocket = websocket
         self.peer_id = peer_id
-        self.connected = True
+        self.logger = logging.getLogger("securetermchat.network.connection")
         
     @property
     def is_connected(self) -> bool:
-        return self.connected and self.websocket.open
+        """Возвращает статус соединения"""
+        return self.websocket.open
         
-    async def send_message(self, message: str) -> None:
-        """Send an encrypted message through the websocket"""
+    async def send_message(self, message: str):
+        """Отправляет сообщение
+        
+        Args:
+            message: Сообщение для отправки
+            
+        Raises:
+            ConnectionError: Если соединение закрыто
+        """
         if not self.is_connected:
-            raise ConnectionError("Connection is closed")
+            raise ConnectionError("Соединение закрыто")
             
         try:
             await self.websocket.send(message)
         except Exception as e:
-            self.connected = False
-            raise ConnectionError(f"Failed to send message: {e}")
+            self.logger.error(f"Ошибка при отправке сообщения: {e}")
+            raise ConnectionError(f"Не удалось отправить сообщение: {e}")
             
-    async def close(self) -> None:
-        """Close the connection"""
-        self.connected = False
-        if self.websocket.open:
+    async def close(self):
+        """Закрывает соединение"""
+        if self.is_connected:
             await self.websocket.close()
+            self.logger.info(f"Соединение с {self.peer_id} закрыто")
 
 class Network:
-    """
-    Реализует P2P-сеть для обмена сообщениями между узлами
-    """
+    """Сетевой модуль для P2P соединений"""
     
-    def __init__(self, config: Config, encryption: E2EEncryption):
-        self.config = config
-        self.encryption = encryption
-        self.signer = MessageSigner()
-        self.reputation = ReputationManager()
-        self.connections: Dict[str, P2PConnection] = {}
-        self.server = None
-        self.connection_timeout = 30  # seconds
-        self.is_running = False
-        self.message_handlers = []
+    def __init__(self, config: Config, security_manager: SecurityManager, port: int = 8765):
+        """
+        Инициализирует сетевой модуль
         
-    async def start(self, host: str = "0.0.0.0", port: int = 8765) -> None:
-        """Start the network server"""
+        Args:
+            config (Config): Конфигурация приложения
+            security_manager (SecurityManager): Менеджер безопасности
+            port (int): Порт для прослушивания (по умолчанию 8765)
+        """
+        self.config = config
+        self.security = security_manager
+        self.port = port
+        self.connections = {}  # peer_id -> connection
+        self._message_handler = None
+        self.server = None
+        self.is_running = False
+        self.connection_timeout = 30  # seconds
+        self.e2e = E2EEncryption()
+        
+        # Настраиваем логирование
+        self.logger = logging.getLogger("securetermchat.network")
+        
+    async def start(self):
+        """Запускает сетевой модуль"""
+        if self.is_running:
+            return
+            
         try:
+            # Инициализируем E2E шифрование
+            try:
+                self.e2e.load_keys()
+            except KeyLoadError:
+                self.logger.info("Генерация новых E2E ключей...")
+                self.e2e.generate_keys()
+            
+            # Запускаем websocket сервер
+            self.logger.info(f"Запуск WebSocket сервера на порту {self.port}")
             self.server = await websockets.serve(
                 self._handle_connection,
-                host,
-                port,
+                "0.0.0.0",  # Слушаем все интерфейсы
+                self.port,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5
             )
-            logger.info(f"Network server started on {host}:{port}")
+            self.is_running = True
+            self.logger.info(f"Сетевой модуль запущен на порту {self.port}")
+            
         except Exception as e:
-            logger.error(f"Failed to start network server: {e}")
-            raise NetworkError(f"Server start failed: {e}")
+            self.logger.error(f"Ошибка при запуске сетевого модуля: {e}", exc_info=True)
+            raise NetworkError(f"Не удалось запустить сетевой модуль: {e}")
             
-    async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
-        """Handle incoming connections"""
+    async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str):
+        """Обрабатывает входящее соединение"""
+        peer_id = None
         try:
-            # Exchange keys and signatures
-            my_key = self.encryption.get_public_key()
-            my_sig_key = self.signer.get_public_key()
-            
-            await websocket.send(json.dumps({
-                "type": "key_exchange",
-                "key": my_key,
-                "sig_key": my_sig_key,
-                "node_id": self.config.get_node_id()
-            }))
-            
-            # Get peer's keys
-            msg = await asyncio.wait_for(websocket.recv(), timeout=self.connection_timeout)
-            data = json.loads(msg)
-            if data["type"] != "key_exchange":
-                raise NetworkError("Invalid key exchange message")
-                
-            peer_id = data["node_id"]
-            peer_key = data["key"]
-            peer_sig_key = data["sig_key"]
-            
-            # Проверяем репутацию пира
-            if not self.reputation.is_trusted(peer_id):
-                logger.warning(f"Connection attempt from untrusted peer {peer_id}")
+            # Валидируем соединение
+            peer_id = await self.security.validate_connection(websocket)
+            if not peer_id:
+                self.logger.warning("Соединение не прошло валидацию")
                 await websocket.close()
                 return
-                
-            # Store peer's keys
-            self.encryption.add_peer_key(peer_id, peer_key)
-            
-            # Create connection
-            connection = P2PConnection(websocket, peer_id)
-            self.connections[peer_id] = connection
-            
-            # Handle messages
+
+            # Добавляем соединение
+            self.connections[peer_id] = P2PConnection(websocket, peer_id)
+            self.logger.info(f"Новое соединение установлено с {peer_id}")
+
+            # Обмениваемся ключами E2E шифрования
             try:
-                async for message in websocket:
-                    try:
-                        # Расшифровываем сообщение
-                        decrypted = self.encryption.decrypt_message(message, peer_id)
-                        data = json.loads(decrypted)
-                        
-                        # Проверяем подпись
-                        if not MessageSigner.verify_json_message(data):
-                            logger.error(f"Invalid signature from {peer_id}")
-                            self.reputation.update_reputation(peer_id, ReputationEvent.INVALID_SIGNATURE)
-                            continue
-                            
-                        # Обновляем репутацию
-                        self.reputation.update_reputation(peer_id, ReputationEvent.MESSAGE_RECEIVED)
-                        
-                        await self._handle_message(data, peer_id)
-                    except E2EEncryptionError as e:
-                        logger.error(f"Failed to decrypt message from {peer_id}: {e}")
-                        self.reputation.update_reputation(peer_id, ReputationEvent.INVALID_ENCRYPTION)
-                    except SignatureVerificationError as e:
-                        logger.error(f"Invalid signature from {peer_id}: {e}")
-                        self.reputation.update_reputation(peer_id, ReputationEvent.INVALID_SIGNATURE)
-            except websockets.exceptions.ConnectionClosed:
-                logger.info(f"Connection closed with peer {peer_id}")
-                self.reputation.update_reputation(peer_id, ReputationEvent.CONNECTION_DROPPED)
-            finally:
-                await self._remove_connection(peer_id)
+                # Отправляем наш публичный ключ
+                public_key = self.e2e.get_public_key()
+                await websocket.send(f"KEY:{public_key}")
                 
-        except Exception as e:
-            logger.error(f"Error handling connection: {e}")
-            if websocket.open:
+                # Получаем публичный ключ пира
+                peer_key_msg = await websocket.recv()
+                if peer_key_msg.startswith("KEY:"):
+                    peer_key = peer_key_msg[4:]
+                    self.e2e.add_peer_key(peer_id, peer_key)
+                    self.logger.info(f"Ключи E2E обменяны с {peer_id}")
+            except Exception as e:
+                self.logger.error(f"Ошибка при обмене ключами с {peer_id}: {e}")
                 await websocket.close()
-                
-    async def _handle_message(self, message: str, peer_id: str) -> None:
-        """Handle decrypted messages"""
-        try:
-            data = json.loads(message)
-            message_type = data.get("type")
+                return
+
+            # Запускаем обработку сообщений в фоновом режиме
+            message_task = asyncio.create_task(self._handle_messages(peer_id, websocket))
             
-            if message_type == "chat":
-                # Handle chat message
-                await self._handle_chat_message(data, peer_id)
-            elif message_type == "system":
-                # Handle system message
-                await self._handle_system_message(data, peer_id)
-            else:
-                logger.warning(f"Unknown message type from {peer_id}: {message_type}")
-        except json.JSONDecodeError:
-            logger.error(f"Invalid JSON message from {peer_id}")
-            
-    async def send_message(self, peer_id: str, message: str) -> None:
-        """Send an encrypted and signed message to a specific peer"""
-        if peer_id not in self.connections:
-            raise NetworkError(f"No connection to peer {peer_id}")
-            
-        try:
-            # Создаем сообщение с подписью
-            data = {
-                "type": "chat",
-                "content": message,
-                "sender": self.config.get_node_id()
-            }
-            signed_data = self.signer.sign_json_message(data)
-            
-            # Шифруем подписанное сообщение
-            encrypted = self.encryption.encrypt_message(json.dumps(signed_data), peer_id)
-            await self.connections[peer_id].send_message(encrypted)
-            
-            # Обновляем репутацию
-            self.reputation.update_reputation(peer_id, ReputationEvent.MESSAGE_SENT)
-            
-        except E2EEncryptionError as e:
-            logger.error(f"Failed to encrypt message for {peer_id}: {e}")
-            raise NetworkError(f"Encryption failed: {e}")
-        except Exception as e:
-            logger.error(f"Failed to send message to {peer_id}: {e}")
-            await self._remove_connection(peer_id)
-            raise NetworkError(f"Send failed: {e}")
-            
-    async def broadcast_message(self, message: str) -> None:
-        """Send an encrypted message to all connected peers"""
-        failed_peers = []
-        for peer_id in list(self.connections.keys()):
+            # Ждем завершения обработки сообщений
             try:
-                await self.send_message(peer_id, message)
-            except NetworkError:
-                failed_peers.append(peer_id)
-                
-        if failed_peers:
-            logger.warning(f"Failed to send message to peers: {', '.join(failed_peers)}")
+                await message_task
+            except asyncio.CancelledError:
+                pass
+
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке соединения: {e}", exc_info=True)
+            if peer_id and peer_id in self.connections:
+                del self.connections[peer_id]
+            await websocket.close()
+
+    async def connect(self, host: str, port: int) -> Optional[str]:
+        """Устанавливает соединение с удаленным узлом"""
+        websocket = None
+        peer_id = None
+        try:
+            self.logger.info(f"Попытка подключения к {host}:{port}")
             
-    async def _remove_connection(self, peer_id: str) -> None:
-        """Remove a peer connection"""
-        if peer_id in self.connections:
-            await self.connections[peer_id].close()
-            del self.connections[peer_id]
-            self.encryption.remove_peer_key(peer_id)
+            # Устанавливаем WebSocket соединение
+            uri = f"ws://{host}:{port}"
+            websocket = await websockets.connect(uri)
             
-    async def stop(self) -> None:
-        """Stop the network server"""
+            # Валидируем соединение
+            peer_id = await self.security.validate_outgoing_connection(websocket)
+            if not peer_id:
+                await websocket.close()
+                raise ConnectionError("Соединение отклонено по соображениям безопасности")
+
+            # Добавляем соединение
+            self.connections[peer_id] = P2PConnection(websocket, peer_id)
+            self.logger.info(f"Соединение установлено с {peer_id}")
+            
+            # Обмениваемся ключами E2E шифрования
+            try:
+                # Получаем публичный ключ пира
+                peer_key_msg = await websocket.recv()
+                if peer_key_msg.startswith("KEY:"):
+                    peer_key = peer_key_msg[4:]
+                    self.e2e.add_peer_key(peer_id, peer_key)
+                    
+                    # Отправляем наш публичный ключ
+                    public_key = self.e2e.get_public_key()
+                    await websocket.send(f"KEY:{public_key}")
+                    
+                    self.logger.info(f"Ключи E2E обменяны с {peer_id}")
+            except Exception as e:
+                self.logger.error(f"Ошибка при обмене ключами с {peer_id}: {e}")
+                await websocket.close()
+                raise ConnectionError(f"Ошибка при обмене ключами: {e}")
+            
+            # Запускаем обработку сообщений в фоновом режиме
+            asyncio.create_task(self._handle_messages(peer_id, websocket))
+            
+            return peer_id
+
+        except Exception as e:
+            if websocket:
+                await websocket.close()
+            if peer_id and peer_id in self.connections:
+                del self.connections[peer_id]
+            self.logger.error(f"Ошибка подключения к {host}:{port}: {e}")
+            raise ConnectionError(f"Не удалось установить соединение: {str(e)}")
+
+    async def _handle_messages(self, peer_id: str, websocket):
+        """Обрабатывает входящие сообщения от пира"""
+        try:
+            while True:
+                try:
+                    message = await websocket.recv()
+                    
+                    # Пропускаем сообщения обмена ключами
+                    if message.startswith("KEY:"):
+                        continue
+                        
+                    # Пробуем расшифровать сообщение
+                    try:
+                        decrypted = self.e2e.decrypt_message(peer_id, message)
+                        message = decrypted
+                    except Exception as e:
+                        self.logger.error(f"Ошибка расшифровки сообщения от {peer_id}: {e}")
+                        continue
+                        
+                    # Вызываем обработчик сообщений
+                    if self._message_handler:
+                        await self._message_handler(peer_id, message)
+                        self.logger.debug(f"Получено сообщение от {peer_id}: {message}")
+                        
+                except websockets.exceptions.ConnectionClosed:
+                    break
+                except Exception as e:
+                    self.logger.error(f"Ошибка при обработке сообщения от {peer_id}: {e}")
+                    continue
+                    
+        finally:
+            if peer_id in self.connections:
+                del self.connections[peer_id]
+                self.logger.info(f"Соединение с {peer_id} удалено")
+            
+    async def send_message(self, peer_id: str, message: str):
+        """Отправляет сообщение указанному пиру
+        
+        Args:
+            peer_id: Идентификатор пира
+            message: Сообщение для отправки
+            
+        Raises:
+            ConnectionError: Если соединение не установлено
+        """
+        if peer_id not in self.connections:
+            raise ConnectionError(f"Нет соединения с {peer_id}")
+            
+        try:
+            # Шифруем сообщение
+            encrypted = self.e2e.encrypt_message(peer_id, message)
+            
+            # Отправляем сообщение
+            connection = self.connections[peer_id]
+            await connection.send_message(encrypted)
+        except E2EEncryptionError as e:
+            self.logger.error(f"Ошибка шифрования сообщения для {peer_id}: {e}")
+            raise ConnectionError(f"Не удалось зашифровать сообщение: {e}")
+        except Exception as e:
+            self.logger.error(f"Ошибка при отправке сообщения {peer_id}: {e}")
+            raise
+            
+    async def stop(self):
+        """Останавливает сетевой модуль"""
+        if not self.is_running:
+            return
+            
+        # Закрываем все соединения
+        for connection in self.connections.values():
+            await connection.close()
+        self.connections.clear()
+        
+        # Останавливаем сервер
         if self.server:
             self.server.close()
             await self.server.wait_closed()
             
-        for peer_id in list(self.connections.keys()):
-            await self._remove_connection(peer_id)
-            
-        logger.info("Network server stopped")
-
-    def add_message_handler(self, handler: Callable):
-        """
-        Добавляет обработчик входящих сообщений
+        self.is_running = False
+        self.logger.info("Сетевой модуль остановлен")
+        
+    async def _handle_message(self, peer_id: str, message: str):
+        """Обрабатывает входящее сообщение
         
         Args:
-            handler: Функция-обработчик сообщений
+            peer_id: Идентификатор отправителя
+            message: Полученное сообщение
         """
-        self.message_handlers.append(handler)
+        try:
+            # Обновляем репутацию пира
+            await self.security.update_reputation(peer_id, True)
+            
+            try:
+                # Пробуем расшифровать сообщение если оно зашифровано
+                decrypted = self.e2e.decrypt_message(peer_id, message)
+                message = decrypted
+            except E2EEncryptionError:
+                # Если не удалось расшифровать, используем как есть
+                pass
+            
+            # Вызываем обработчик сообщений если он установлен
+            if self._message_handler:
+                await self._message_handler(peer_id, message)
+            
+            self.logger.debug(f"Получено сообщение от {peer_id}: {message}")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке сообщения от {peer_id}: {e}")
+            
+    @property
+    def active_connections(self) -> int:
+        """Возвращает количество активных соединений"""
+        return len(self.connections)
         
+    def get_peer_ids(self) -> List[str]:
+        """Возвращает список идентификаторов подключенных пиров"""
+        return list(self.connections.keys())
+
     def get_active_connections(self) -> List[Dict]:
         """
         Возвращает информацию об активных соединениях
@@ -302,4 +401,12 @@ class Network:
         
     def get_top_peers(self, limit: int = 10) -> List[tuple]:
         """Получить список пиров с наивысшей репутацией"""
-        return self.reputation.get_top_peers(limit) 
+        return self.reputation.get_top_peers(limit)
+        
+    def set_message_handler(self, handler: Callable[[str, str], Awaitable[None]]):
+        """Устанавливает обработчик входящих сообщений
+        
+        Args:
+            handler: Функция обработки сообщений (peer_id, message) -> None
+        """
+        self._message_handler = handler 

@@ -683,3 +683,4 @@ async def test_bootstrap(dht):
     # Проверяем что узлы добавлены в таблицу маршрутизации
     routing_table = await dht.get_routing_table()
     assert len(routing_table) >= len(bootstrap_nodes) 
+ 
