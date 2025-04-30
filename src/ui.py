@@ -375,137 +375,168 @@ class TerminalUI:
 
     async def _handle_input(self):
         """Обрабатывает введенную команду или сообщение"""
+        if not self.input_buffer.strip():
+            return
+            
         if self.command_mode:
-            self._process_command(self.input_buffer)
+            # Убираем начальный слэш и разбиваем на команду и аргументы
+            command = self.input_buffer.lstrip('/')
+            parts = command.split()
+            if not parts:
+                return
+                
+            cmd = parts[0].lower()
+            args = parts[1:]
+            
+            try:
+                # Обрабатываем команды
+                if cmd == "help":
+                    self._show_help()
+                elif cmd == "add":
+                    self._add_contact(args)
+                elif cmd == "connect":
+                    self._connect_contact(args)
+                elif cmd == "disconnect":
+                    self._disconnect_contact()
+                elif cmd == "contacts":
+                    self.view_mode = "contacts"
+                    self.show_message("Переключено в режим просмотра контактов")
+                elif cmd == "status":
+                    self.view_mode = "status"
+                    self.show_message("Переключено в режим просмотра статуса")
+                elif cmd == "chat":
+                    self.view_mode = "chat"
+                    self.show_message("Переключено в режим чата")
+                elif cmd == "clear":
+                    self._clear_history(args)
+                elif cmd == "quit" or cmd == "exit":
+                    self.is_running = False
+                else:
+                    self.show_error(f"Неизвестная команда: {cmd}")
+            except Exception as e:
+                self.show_error(f"Ошибка при выполнении команды: {e}")
         else:
+            # Отправляем сообщение
             await self._send_message(self.input_buffer)
             
         # Очищаем буфер ввода
         self.input_buffer = ""
         self.input_cursor = 0
         self.command_mode = False
-        self._draw_input()
 
-    def _process_command(self, command: str):
-        """Обрабатывает введенную команду"""
-        if command.startswith('/'):
-            parts = command.split(' ')
-            cmd = parts[0].lower()
-            args = parts[1:]
+    def _add_contact(self, args):
+        """Добавляет новый контакт"""
+        if len(args) < 2:
+            self.show_error("Использование: /add <id> <name>")
+            return
             
-            if cmd == '/help':
-                self._show_help()
-            elif cmd == '/exit':
-                if self.on_quit:
-                    asyncio.create_task(self.on_quit())
-            elif cmd == '/add':
-                self._add_contact(args)
-            elif cmd == '/contacts':
-                self.view_mode = "contacts"
-            elif cmd == '/connect':
-                self._connect_contact(args)
-            elif cmd == '/status':
-                self.view_mode = "status"
-            elif cmd == '/disconnect':
-                self.current_contact = None
-            elif cmd == '/chat':
-                self.view_mode = "chat"
-            elif cmd == '/clear':
-                self._clear_history(args)
+        contact_id = args[0]
+        contact_name = " ".join(args[1:])  # Имя может содержать пробелы
+        
+        try:
+            # Добавляем контакт в список
+            self.contacts[contact_id] = {
+                'name': contact_name,
+                'added_at': datetime.now().isoformat()
+            }
+            
+            # Вызываем обработчик если он установлен
+            if self.on_contact_add:
+                asyncio.create_task(self.on_contact_add(contact_id, self.contacts[contact_id]))
+            
+            # Показываем сообщение об успехе
+            self.show_message(f"Контакт {contact_name} ({contact_id}) успешно добавлен")
+            
+        except Exception as e:
+            self.show_error(f"Ошибка при добавлении контакта: {e}")
+
+    def _connect_contact(self, args):
+        """Подключается к контакту"""
+        if not args:
+            self.show_error("Использование: /connect <id>")
+            return
+            
+        contact_id = args[0]
+        if contact_id not in self.contacts:
+            self.show_error(f"Контакт {contact_id} не найден")
+            return
+            
+        self.current_contact = contact_id
+        self.view_mode = "chat"
+        self.show_message(f"Подключено к чату с {self.contacts[contact_id]['name']}")
+
+    def _disconnect_contact(self):
+        """Отключается от текущего контакта"""
+        if not self.current_contact:
+            self.show_error("Нет активного чата")
+            return
+            
+        contact_name = self.contacts[self.current_contact]['name']
+        self.current_contact = None
+        self.show_message(f"Отключено от чата с {contact_name}")
+
+    def _clear_history(self, args):
+        """Очищает историю сообщений"""
+        try:
+            if args:
+                contact_id = args[0]
+                if contact_id in self.contacts:
+                    self.history.clear_history(contact_id)
+                    self.show_message(f"История сообщений для {contact_id} очищена")
+                else:
+                    self.show_error(f"Контакт {contact_id} не найден")
             else:
-                print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                      f"Неизвестная команда: {cmd}" + self.term.normal)
+                self.history.clear_all_history()
+                self.show_message("Вся история сообщений очищена")
+        except Exception as e:
+            self.show_error(f"Ошибка при очистке истории: {e}")
+
+    async def _send_message(self, text: str):
+        """Отправляет сообщение"""
+        if not text.strip():
+            return
+            
+        if not self.current_contact:
+            self.show_error("Сначала выберите контакт (/connect <id>)")
+            return
+            
+        try:
+            if self.on_message_send:
+                await self.on_message_send(self.current_contact, text)
+                
+            # Добавляем сообщение в историю
+            self.add_message(self.current_contact, text, True)
+            
+        except Exception as e:
+            self.show_error(f"Ошибка при отправке сообщения: {e}")
 
     def _show_help(self):
         """Показывает справку по командам"""
+        self.view_mode = "help"
         help_text = [
             "Доступные команды:",
             "/help - Показать эту справку",
-            "/exit - Выйти из приложения",
             "/add <id> <name> - Добавить новый контакт",
             "/contacts - Показать список контактов",
             "/connect <id> - Начать чат с контактом",
             "/disconnect - Закрыть текущий чат",
-            "/status - Показать статус сети",
+            "/status - Показать статус системы",
             "/chat - Вернуться к чату",
             "/clear [id] - Очистить историю сообщений",
+            "/exit - Выйти из приложения",
             "",
             "Горячие клавиши:",
             "Tab - Переключение режимов просмотра",
             "Ctrl+C - Выход из приложения"
         ]
         
+        # Очищаем область вывода
+        for i in range(2, self.term.height - 3):
+            print(self.term.move(i, 0) + self.term.clear_eol)
+            
+        # Выводим справку
         for i, line in enumerate(help_text):
-            print(self.term.move(2 + i, 0) + self.term.clear_eol + line)
-
-    def _add_contact(self, args):
-        """Добавляет новый контакт"""
-        if len(args) < 2:
-            print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                  "Использование: /add <id> <name>" + self.term.normal)
-            return
-            
-        contact_id = args[0]
-        contact_name = args[1]
-        
-        if self.on_contact_add:
-            asyncio.create_task(self.on_contact_add(contact_id, {
-                'name': contact_name,
-                'added_at': datetime.now().isoformat()
-            }))
-
-    def _show_contacts(self):
-        """Показывает список контактов"""
-        self.view_mode = "contacts"
-
-    def _connect_contact(self, args):
-        """Подключается к контакту"""
-        if not args:
-            print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                  "Использование: /connect <id>" + self.term.normal)
-            return
-            
-        contact_id = args[0]
-        if contact_id not in self.contacts:
-            print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                  f"Контакт {contact_id} не найден" + self.term.normal)
-            return
-            
-        self.current_contact = contact_id
-        self.view_mode = "chat"
-
-    def _show_status(self):
-        """Показывает статус сети"""
-        self.view_mode = "status"
-        
-    def _clear_history(self, args):
-        """Очищает историю сообщений"""
-        if args:
-            contact_id = args[0]
-            if contact_id in self.contacts:
-                self.history.clear_history(contact_id)
-                print(self.term.move(self.term.height - 2, 0) + self.term.green + 
-                      f"История сообщений для {contact_id} очищена" + self.term.normal)
-            else:
-                print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                      f"Контакт {contact_id} не найден" + self.term.normal)
-        else:
-            self.history.clear_all_history()
-            print(self.term.move(self.term.height - 2, 0) + self.term.green + 
-                  "Вся история сообщений очищена" + self.term.normal)
-
-    async def _send_message(self, text: str):
-        """Отправляет сообщение"""
-        if not self.current_contact:
-            print(self.term.move(self.term.height - 2, 0) + self.term.red + 
-                  "Сначала выберите контакт (/connect)" + self.term.normal)
-            return
-            
-        if not text.strip():
-            return
-            
-        if self.on_message_send:
-            await self.on_message_send(self.current_contact, text)
+            print(self.term.move(i + 2, 0) + line)
 
     def add_message(self, contact_id: str, content: str, is_outgoing: bool):
         """Добавляет сообщение в историю"""
@@ -528,4 +559,10 @@ class TerminalUI:
 
     def show_error(self, message: str):
         """Показывает сообщение об ошибке"""
-        print(self.term.move(self.term.height - 2, 0) + self.term.red + message + self.term.normal) 
+        print(self.term.move(self.term.height - 2, 0) + self.term.red + message + self.term.normal)
+
+    def show_message(self, message: str):
+        """Показывает информационное сообщение"""
+        print(self.term.move(self.term.height - 2, 0) + 
+              self.term.clear_eol + 
+              self.term.green + message + self.term.normal) 

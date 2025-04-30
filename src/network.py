@@ -191,26 +191,161 @@ class Network:
             config: Объект конфигурации
         """
         self.config = config
-        self.connections = {}
+        self.connections: Dict[str, P2PConnection] = {}
         self.server = None
         self.is_running = False
-        self.connection_timeout = 30  # 30 seconds timeout for connections
+        self.connection_timeout = 30
+        self.crypto_manager = CryptoManager(config)
+        self.security_manager = SecurityManager(config)
+        self.message_handlers = []
         
     async def start(self):
-        """Start the network server"""
-        if self.is_running:
-            return
+        """Запускает сетевой сервер"""
+        try:
+            host = self.config.get_listen_address()[0]
+            port = self.config.get_listen_address()[1]
             
-        self.is_running = True
-        self.server = await websockets.serve(
-            self._handle_connection,
-            '0.0.0.0',  # Listen on all interfaces
-            self.config.port,
-            ping_interval=20,  # Send ping every 20 seconds
-            ping_timeout=10,   # Wait 10 seconds for pong
-            close_timeout=5    # Wait 5 seconds for close
-        )
-        logger.info(f"Network server started on port {self.config.port}")
+            self.server = await websockets.serve(
+                self._handle_connection,
+                host,
+                port,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5
+            )
+            
+            self.is_running = True
+            logger.info(f"Network server started on {host}:{port}")
+            
+            # Подключаемся к известным узлам
+            for node in self.config.get_bootstrap_nodes():
+                host, port = node.split(":")
+                asyncio.create_task(self.connect_to_peer(host, int(port)))
+                
+        except Exception as e:
+            logger.error(f"Failed to start network server: {e}")
+            raise
+            
+    async def connect_to_peer(self, host: str, port: int) -> bool:
+        """
+        Подключается к новому пиру
+        
+        Args:
+            host: Хост пира
+            port: Порт пира
+            
+        Returns:
+            bool: True если подключение успешно, False в противном случае
+        """
+        peer_address = f"{host}:{port}"
+        
+        if peer_address in self.connections:
+            logger.warning(f"Already connected to {peer_address}")
+            return False
+            
+        try:
+            connection = P2PConnection(
+                host=host,
+                port=port,
+                node_id=self.config.get_node_id(),
+                public_key=self.config.public_key.encode().hex(),
+                crypto_manager=self.crypto_manager,
+                security_manager=self.security_manager
+            )
+            
+            await connection.connect()
+            
+            if connection.connected:
+                self.connections[peer_address] = connection
+                logger.info(f"Successfully connected to peer {peer_address}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to connect to peer {peer_address}: {e}")
+            
+        return False
+        
+    async def disconnect_from_peer(self, peer_address: str):
+        """
+        Отключается от пира
+        
+        Args:
+            peer_address: Адрес пира в формате host:port
+        """
+        if peer_address in self.connections:
+            connection = self.connections[peer_address]
+            await connection.stop()
+            del self.connections[peer_address]
+            logger.info(f"Disconnected from peer {peer_address}")
+            
+    async def send_to_peer(self, peer_address: str, message: dict) -> bool:
+        """
+        Отправляет сообщение конкретному пиру
+        
+        Args:
+            peer_address: Адрес пира в формате host:port
+            message: Сообщение для отправки
+            
+        Returns:
+            bool: True если сообщение отправлено успешно, False в противном случае
+        """
+        if peer_address not in self.connections:
+            logger.error(f"No connection to peer {peer_address}")
+            return False
+            
+        try:
+            connection = self.connections[peer_address]
+            await connection.send_message(message["type"], message["data"])
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send message to peer {peer_address}: {e}")
+            return False
+            
+    def add_message_handler(self, handler: Callable):
+        """
+        Добавляет обработчик входящих сообщений
+        
+        Args:
+            handler: Функция-обработчик сообщений
+        """
+        self.message_handlers.append(handler)
+        
+    async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str):
+        """
+        Обрабатывает входящее подключение
+        
+        Args:
+            websocket: WebSocket соединение
+            path: Путь запроса
+        """
+        peer_address = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        logger.info(f"New connection from {peer_address}")
+        
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    # Уведомляем всех обработчиков о новом сообщении
+                    for handler in self.message_handlers:
+                        await handler(peer_address, data)
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON from {peer_address}")
+                except Exception as e:
+                    logger.error(f"Error handling message from {peer_address}: {e}")
+                    
+        except WebSocketException as e:
+            logger.error(f"WebSocket error with {peer_address}: {e}")
+        finally:
+            await self.disconnect_from_peer(peer_address)
+            
+    def get_connected_peers(self) -> List[str]:
+        """
+        Возвращает список подключенных пиров
+        
+        Returns:
+            List[str]: Список адресов подключенных пиров
+        """
+        return list(self.connections.keys())
         
     async def stop(self):
         """Stop the network server"""
@@ -234,129 +369,6 @@ class Network:
             await self.server.wait_closed()
             
         logger.info("Network server stopped")
-        
-    async def _handle_connection(self, websocket, path):
-        """Handle incoming websocket connection"""
-        try:
-            async with websocket:
-                # Set connection timeout
-                websocket.timeout = self.connection_timeout
-                
-                # Get peer address
-                peer = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-                
-                # Create connection object
-                conn = P2PConnection(websocket, peer)
-                self.connections[peer] = conn
-                
-                try:
-                    # Handle messages
-                    async for message in websocket:
-                        await self._handle_message(conn, message)
-                except websockets.exceptions.ConnectionClosed:
-                    logger.info(f"Connection closed with {peer}")
-                except Exception as e:
-                    logger.error(f"Error handling connection with {peer}: {e}")
-                finally:
-                    # Remove connection
-                    self.connections.pop(peer, None)
-        except Exception as e:
-            logger.error(f"Error in connection handler: {e}")
-            
-    async def _handle_message(self, conn, message):
-        """Handle incoming message"""
-        try:
-            data = json.loads(message)
-            # Process message based on type
-            if data.get("type") == "get_peers":
-                await self._handle_get_peers(conn)
-            # Add other message type handlers here
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON message from {conn.peer}")
-        except Exception as e:
-            logger.error(f"Error handling message from {conn.peer}: {e}")
-            
-    async def _handle_get_peers(self, conn):
-        """Handle get_peers request"""
-        try:
-            # Get list of known peers
-            peers = list(self.connections.keys())
-            
-            # Send response
-            await conn.send_message({
-                "type": "peers_list",
-                "peers": peers
-            })
-        except Exception as e:
-            logger.error(f"Error handling get_peers request: {e}")
-            
-    async def connect(self, peer_address):
-        """Connect to a peer"""
-        if peer_address in self.connections:
-            return
-            
-        try:
-            # Parse address
-            host, port = peer_address.split(':')
-            port = int(port)
-            
-            # Connect with timeout
-            websocket = await websockets.connect(
-                f"ws://{host}:{port}",
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=5
-            )
-            
-            # Create connection object
-            conn = P2PConnection(websocket, peer_address)
-            self.connections[peer_address] = conn
-            
-            # Start message handler
-            asyncio.create_task(self._handle_connection(websocket, None))
-            
-            logger.info(f"Connected to peer: {peer_address}")
-        except Exception as e:
-            logger.warning(f"Failed to connect to {peer_address}: {e}")
-            raise
-            
-    async def send_message(self, peer_address, message):
-        """Send message to peer"""
-        conn = self.connections.get(peer_address)
-        if not conn:
-            raise ConnectionError(f"No connection to {peer_address}")
-            
-        try:
-            await conn.send_message(message)
-        except Exception as e:
-            logger.error(f"Error sending message to {peer_address}: {e}")
-            raise
-        
-    def set_message_handler(self, handler):
-        """Set the message handler"""
-        self.on_message = handler
-        
-    async def broadcast_message(self, message: Dict) -> int:
-        """
-        Отправляет сообщение всем подключенным узлам
-        
-        Args:
-            message (Dict): Сообщение для отправки
-            
-        Returns:
-            int: Количество узлов, которым было отправлено сообщение
-        """
-        sent_count = 0
-        
-        for connection in self.connections:
-            try:
-                encrypted = self.crypto.encrypt(message)
-                await connection.send(encrypted)
-                sent_count += 1
-            except Exception as e:
-                logger.warning(f"Ошибка при отправке сообщения узлу {connection.remote_address}: {e}")
-                
-        return sent_count
         
     def get_active_connections(self) -> List[Dict]:
         """

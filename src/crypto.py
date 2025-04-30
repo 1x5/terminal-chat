@@ -27,8 +27,9 @@ logger = logging.getLogger("securetermchat.crypto")
 class CryptoManager:
     """Менеджер криптографии для приложения"""
     
-    def __init__(self):
+    def __init__(self, config=None):
         """Initialize the crypto manager"""
+        self.config = config
         private_key = PrivateKey.generate()
         self.private_key = private_key
         self.public_key = private_key.public_key

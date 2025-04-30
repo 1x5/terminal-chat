@@ -28,12 +28,19 @@ class SecurityConfig:
 class SecurityManager:
     """Менеджер безопасности"""
     
-    def __init__(self, crypto: CryptoManager, config: SecurityConfig):
-        self.crypto = crypto
+    def __init__(self, config):
+        """
+        Инициализирует менеджер безопасности
+        
+        Args:
+            config: Конфигурация приложения
+        """
         self.config = config
+        self.crypto = CryptoManager(config)
+        self.security_config = SecurityConfig()
         self.challenges: Dict[str, str] = {}
         self.authenticated_nodes: Set[str] = set()
-        self.connections: Dict[str, List[float]] = {}  # Changed to List[float] to track multiple connections
+        self.connections: Dict[str, List[float]] = {}
         self.message_counts: Dict[str, int] = {}
         self.last_message_time: Dict[str, float] = {}
         self.node_reputation: Dict[str, float] = {}
@@ -281,50 +288,6 @@ class SecurityManager:
         }
 
     async def check_sybil_attack(self, node_id: str) -> bool:
-        """Проверяет наличие Sybil-атаки"""
-        # Проверяем, не заблокирован ли узел
-        if node_id in self.blocked_nodes:
-            logger.debug(f"{node_id} is blocked")
-            return False
-            
-        # Проверяем таймаут для Sybil-узлов
-        current_time = time.time()
-        if node_id in self.sybil_nodes:
-            if current_time - self.last_reputation_update.get(node_id, 0) >= self.config.connection_timeout:
-                logger.debug(f"Removing {node_id} from Sybil nodes due to timeout")
-                self.sybil_nodes.remove(node_id)
-                if node_id in self.connections:
-                    self.connections[node_id] = []
-            else:
-                logger.debug(f"{node_id} is still marked as Sybil")
-                return False
-            
-        # Проверяем репутацию
-        reputation = self.get_node_reputation(node_id)
-        logger.debug(f"Current reputation for {node_id}: {reputation}")
-        if reputation <= self.config.min_reputation:  # Изменено с < на <=
-            # Если репутация слишком низкая, помечаем как Sybil
-            logger.debug(f"Marking {node_id} as Sybil due to low reputation")
-            self.sybil_nodes.add(node_id)
-            self.last_reputation_update[node_id] = current_time
-            return False
-            
-        # Проверяем количество подключений
-        connections = len([
-            timestamp for timestamp in self.connections.get(node_id, [])
-            if current_time - timestamp < self.config.connection_timeout
-        ])
-        logger.debug(f"Active connections for {node_id}: {connections}")
-                         
-        if connections >= self.config.sybil_threshold:
-            logger.debug(f"Marking {node_id} as Sybil due to too many connections")
-            self.sybil_nodes.add(node_id)
-            # Снижаем репутацию при обнаружении Sybil-атаки
-            await self.update_reputation(node_id, False)
-            self.last_reputation_update[node_id] = current_time
-            return False
-            
-        return True 
         """Проверяет наличие Sybil-атаки"""
         # Проверяем, не заблокирован ли узел
         if node_id in self.blocked_nodes:

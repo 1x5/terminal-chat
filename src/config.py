@@ -43,11 +43,10 @@ class Config:
         # Значения конфигурации по умолчанию
         self.config = {
             "node_id": None,  # Будет сгенерирован при первом запуске
-            "listen_host": "0.0.0.0",
-            "listen_port": 8765,
+            "listen_host": "127.0.0.1",  # Локальный хост для тестирования
+            "listen_port": 8765,  # Фиксированный порт для тестирования
             "bootstrap_nodes": [
-                "seed1.securetermchat.example:8765",
-                "seed2.securetermchat.example:8765"
+                "127.0.0.1:8765"  # Локальный узел для тестирования
             ],
             "min_hops": 3,
             "max_hops": 5,
@@ -58,7 +57,7 @@ class Config:
             "message_expiry": 86400,  # 24 часа
             "dummy_traffic_interval": 60,  # 1 минута
             "max_peers": 50,
-            "ui_refresh_rate": 1,  # Частота обновления UI в секундах
+            "ui_refresh_rate": 0.1,  # Частота обновления UI в секундах
             "log_level": "INFO",
             "data_dir": None  # Будет установлен при загрузке
         }
@@ -124,8 +123,8 @@ class Config:
         # Проверяем listen_port
         if not isinstance(self.config["listen_port"], int):
             errors.append("listen_port должен быть целым числом")
-        elif not (1024 <= self.config["listen_port"] <= 65535):
-            errors.append("listen_port должен быть в диапазоне 1024-65535")
+        elif self.config["listen_port"] != 0 and not (1024 <= self.config["listen_port"] <= 65535):
+            errors.append("listen_port должен быть 0 (для автоматического выбора) или в диапазоне 1024-65535")
             
         # Проверяем bootstrap_nodes
         if not isinstance(self.config["bootstrap_nodes"], list):
