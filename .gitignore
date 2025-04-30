@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+*.cover
+.pytest_cache/
+coverage_html/
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Project specific
+data/
+logs/
+*.log
+*.db
+*.sqlite3
+
+# Логи установщика
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Окружения
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Файлы IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Специфичные для приложения
+securetermchat.log
+.securetermchat/
+*.log
+
+# Логи
+debug.log
+
+# Пользовательские данные
+*.json
+!example_config.json
+
+# Файлы специфичные для ОС
+.DS_Store
+Thumbs.db 

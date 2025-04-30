@@ -1,0 +1,16 @@
+{
+  "bootstrap_nodes": [
+    "node1.securetermchat.example.com:8080",
+    "node2.securetermchat.example.com:8080",
+    "node3.securetermchat.example.com:8080"
+  ],
+  "min_hops": 3,
+  "max_hops": 5,
+  "message_ttl": 600,
+  "dummy_traffic_probability": 0.2,
+  "use_fixed_packet_size": true,
+  "fixed_packet_size": 4096,
+  "network_port": 0,
+  "log_level": "INFO",
+  "ui_theme": "dark"
+} 
