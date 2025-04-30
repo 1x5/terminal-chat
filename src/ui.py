@@ -18,7 +18,7 @@ from prompt_toolkit.history import FileHistory
 
 from src.message_history import MessageHistory
 from src.config import Config
-from src.network import P2PNetwork
+from src.network import Network
 from src.onion_routing import OnionRoutingManager
 
 logger = logging.getLogger("securetermchat.ui")
@@ -28,13 +28,13 @@ class TerminalUI:
     Реализует терминальный интерфейс для мессенджера
     """
     
-    def __init__(self, config: Config, network: P2PNetwork, onion_manager: OnionRoutingManager):
+    def __init__(self, config: Config, network: Network, onion_manager: OnionRoutingManager):
         """
         Инициализирует пользовательский интерфейс
         
         Args:
             config (Config): Конфигурация приложения
-            network (P2PNetwork): Сетевой модуль
+            network (Network): Сетевой модуль
             onion_manager (OnionRoutingManager): Менеджер луковой маршрутизации
         """
         # Сохраняем зависимости
@@ -81,13 +81,29 @@ class TerminalUI:
             })
         )
         
-    def start(self):
-        """Запускает пользовательский интерфейс"""
-        self.is_running = True
-        logger.info("Запуск пользовательского интерфейса")
+        self.messages = []
+        self.terminal = None
+        self.input_task = None
         
-        # Запускаем основной цикл
-        asyncio.create_task(self._run())
+    async def start(self):
+        """Запускает пользовательский интерфейс"""
+        try:
+            self.is_running = True
+            self.terminal = Terminal()
+            
+            # Запускаем обработку ввода в отдельной задаче
+            self.input_task = asyncio.create_task(self._process_input())
+            
+            # Основной цикл обновления UI
+            while self.is_running:
+                self._draw()
+                await asyncio.sleep(0.1)
+                
+        except Exception as e:
+            logger.error(f"Ошибка в UI: {e}")
+            raise
+        finally:
+            self.stop()
 
     def stop(self):
         """Останавливает пользовательский интерфейс"""
@@ -124,6 +140,26 @@ class TerminalUI:
             logger.error(f"Ошибка в работе пользовательского интерфейса: {e}")
             raise e
             
+    def _draw(self):
+        """Отрисовывает интерфейс"""
+        # Очищаем экран
+        print(self.terminal.clear)
+        
+        # Отрисовываем заголовок
+        print(self.terminal.move(0, 0) + self.terminal.bold + "SecureTermChat" + self.terminal.normal)
+        
+        # Отрисовываем сообщения
+        y = 2
+        for msg in self.messages[-10:]:  # Показываем последние 10 сообщений
+            print(self.terminal.move(y, 0) + msg)
+            y += 1
+            
+        # Отрисовываем строку ввода
+        print(self.terminal.move(self.terminal.height - 2, 0) + "> " + self.input_buffer)
+        
+        # Перемещаем курсор в конец строки ввода
+        print(self.terminal.move(self.terminal.height - 2, len(self.input_buffer) + 2))
+
     def _draw_header(self):
         """Отрисовывает заголовок интерфейса"""
         # Очищаем верхнюю строку

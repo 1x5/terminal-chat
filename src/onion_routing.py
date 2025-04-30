@@ -25,7 +25,7 @@ from src.crypto import (
     unwrap_onion_layer,
     CryptoManager
 )
-from src.network import P2PNetwork
+from src.network import Network
 from src.config import Config
 
 logger = logging.getLogger("securetermchat.onion_routing")
@@ -467,18 +467,20 @@ class OnionRoutingManager:
     обеспечивает анонимную передачу сообщений через сеть.
     """
     
-    def __init__(self, config: Config, crypto: CryptoManager):
+    def __init__(self, config: Config, crypto: CryptoManager, network: Network):
         """
         Инициализирует менеджер луковой маршрутизации
         
         Args:
-            config: Объект конфигурации
-            crypto: Объект шифрования
+            config (Config): Конфигурация приложения
+            crypto (CryptoManager): Менеджер шифрования
+            network (Network): Сетевой модуль
         """
         self.config = config
         self.crypto = crypto
-        self.network = P2PNetwork(config, crypto)
-        self.circuits = {}  # circuit_id -> circuit_info
+        self.network = network
+        self.circuits = {}  # circuit_id -> OnionCircuit
+        self.message_handler = None
         self.next_circuit_id = 0
         
     async def start(self):
@@ -626,8 +628,8 @@ class OnionRoutingManager:
                             )
                         else:
                             # Это последний узел, обрабатываем сообщение
-                            if self.on_message:
-                                await self.on_message(circuit_id, unwrapped)
+                            if self.message_handler:
+                                await self.message_handler(circuit_id, unwrapped)
                                 
             elif data["type"] == "teardown":
                 # Обрабатываем команду разрыва цепочки
@@ -645,4 +647,4 @@ class OnionRoutingManager:
         Args:
             handler: Функция-обработчик
         """
-        self.on_message = handler 
+        self.message_handler = handler 

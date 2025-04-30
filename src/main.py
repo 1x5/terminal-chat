@@ -13,6 +13,7 @@ from typing import Optional
 from src.config import Config
 from src.network import Network
 from src.ui import TerminalUI
+from src.onion_manager import OnionRoutingManager
 
 logger = logging.getLogger("main")
 
@@ -22,23 +23,31 @@ class Application:
     """
     
     def __init__(self):
-        """Инициализирует приложение"""
+        """Инициализация приложения"""
         self.config = Config()
+        self.is_running = False
+        
+    async def initialize(self):
+        """Инициализирует компоненты приложения"""
+        # Загружаем конфигурацию
+        await self.config.load()
+        
+        # Инициализируем компоненты
         self.network = Network(self.config)
-        self.ui = TerminalUI(self.config.data_dir)
-        self.running = False
+        self.onion_manager = OnionRoutingManager(self.config)
+        self.ui = TerminalUI(self.config, self.network, self.onion_manager)
         
     async def start(self):
         """Запускает приложение"""
         try:
-            # Загружаем конфигурацию
-            self.config.load()
+            # Инициализируем компоненты
+            await self.initialize()
             
             # Запускаем сеть
             await self.network.start()
             
             # Запускаем UI
-            self.running = True
+            self.is_running = True
             await self.ui.start()
             
         except Exception as e:
@@ -49,31 +58,20 @@ class Application:
             
     async def stop(self):
         """Останавливает приложение"""
-        if self.running:
-            self.running = False
+        if self.is_running:
+            self.is_running = False
             await self.network.stop()
             
-def main():
+async def main():
     """Точка входа в приложение"""
-    # Настраиваем логирование
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(os.path.join(os.path.expanduser("~/.securetermchat"), "app.log"))
-        ]
-    )
-    
-    # Создаем и запускаем приложение
-    app = Application()
     try:
-        asyncio.run(app.start())
+        app = Application()
+        await app.start()
     except KeyboardInterrupt:
         logger.info("Приложение остановлено пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
-        sys.exit(1)
-        
+        raise
+
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 

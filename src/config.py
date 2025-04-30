@@ -21,6 +21,16 @@ class Config:
     Класс управления конфигурацией приложения
     """
     
+    @property
+    def port(self) -> int:
+        """Возвращает порт для прослушивания"""
+        return self.config["listen_port"]
+        
+    @property
+    def data_dir(self) -> str:
+        """Возвращает директорию для данных"""
+        return self.config["data_dir"]
+        
     def __init__(self, config_path: str = None):
         """
         Инициализация объекта конфигурации
@@ -72,14 +82,11 @@ class Config:
                 logger.info("Файл конфигурации не найден, используются значения по умолчанию")
             
             # Устанавливаем data_dir
-            if self.config.get("data_dir"):
-                self.data_dir = self.config["data_dir"]
-            else:
+            if not self.config.get("data_dir"):
                 config_dir = os.path.dirname(self.config_path)
                 if "securetermchat" not in config_dir:
                     config_dir = os.path.join(config_dir, "securetermchat")
-                self.data_dir = os.path.join(config_dir, "data")
-                self.config["data_dir"] = self.data_dir
+                self.config["data_dir"] = os.path.join(config_dir, "data")
             
             # Создаем директории
             os.makedirs(os.path.dirname(self.config_path), exist_ok=True)

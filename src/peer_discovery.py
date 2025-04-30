@@ -23,338 +23,109 @@ class PeerDiscovery:
     Класс для обнаружения пиров в сети
     """
     
-    def __init__(self, config, message_handler=None):
+    def __init__(self, config, network):
         """
         Инициализирует модуль обнаружения пиров
         
         Args:
             config: Объект конфигурации
-            message_handler: Обработчик сообщений от пиров
+            network: Объект сети
         """
         self.config = config
-        self.message_handler = message_handler
-        
-        # Хранение информации о пирах
-        self.known_peers = {}  # id -> {'address': str, 'port': int, 'public_key': str, 'last_seen': float}
-        self.active_connections = {}  # id -> NodeConnection
-        
-        # Метаданные для алгоритма обнаружения
-        self.bootstrap_nodes = config.get_bootstrap_nodes()
-        self.discovery_running = False
-        self.max_peers = config.config.get("max_peers", 50)
-        self.discovered_peers_count = 0
-        
-        # Кеш недоступных узлов, чтобы не пытаться подключаться к ним слишком часто
-        self.unreachable_peers = {}  # address:port -> last_attempt_time
-        
-        # Интервалы обнаружения и обслуживания
-        self.discovery_interval = config.config.get("discovery_interval", 300)  # 5 минут
-        self.maintenance_interval = config.config.get("maintenance_interval", 60)  # 1 минута
-        
-        # Флаг работы
+        self.network = network
+        self.known_peers = set()
         self.is_running = False
-        
-        # HTTP-сессия для запросов к bootstrap-серверам
-        self.session = None
+        self.discovery_task = None
+        self.discovery_interval = 60  # 60 seconds between discovery attempts
+        self.max_peers = 10  # Maximum number of peers to maintain
         
     async def start(self):
-        """Запускает процесс обнаружения пиров"""
-        self.discovery_running = True
+        """Start peer discovery service"""
+        if self.is_running:
+            return
+            
         self.is_running = True
-        self.session = aiohttp.ClientSession()
-        
-        # Загружаем начальный список пиров
-        await self.load_bootstrap_peers()
-        
-        # Запускаем основные задачи
-        self.discovery_task = asyncio.create_task(self._peer_discovery_loop())
-        self.maintenance_task = asyncio.create_task(self._connection_maintenance())
-        self.periodic_task = asyncio.create_task(self._periodic_discovery())
-        
-        # Выполняем начальное обнаружение пиров
-        await self._discover_initial_peers()
-        
-        # Устанавливаем running в True
-        self.running = True
-        
-        logger.info("Система обнаружения пиров запущена")
+        self.discovery_task = asyncio.create_task(self._discovery_loop())
+        logger.info("Peer discovery service started")
         
     async def stop(self):
-        """Останавливает процесс обнаружения пиров"""
-        self.discovery_running = False
-        self.is_running = False
-        
-        # Закрываем все активные соединения
-        for conn in list(self.active_connections.values()):
-            await conn.close()
-        
-        self.active_connections.clear()
-        
-        # Закрываем HTTP-сессию
-        if self.session:
-            await self.session.close()
-            self.session = None
+        """Stop peer discovery service"""
+        if not self.is_running:
+            return
             
-        # Отменяем все задачи
-        tasks = []
-        for task_name in ['discovery_task', 'maintenance_task', 'periodic_task']:
-            if hasattr(self, task_name) and getattr(self, task_name):
-                task = getattr(self, task_name)
-                task.cancel()
-                tasks.append(task)
-                setattr(self, task_name, None)
-                
-        # Ждем завершения всех задач
-        if tasks:
+        self.is_running = False
+        if self.discovery_task:
+            self.discovery_task.cancel()
             try:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.discovery_task
             except asyncio.CancelledError:
                 pass
-            
-        # Устанавливаем running в False
-        self.running = False
-            
-        logger.info("Система обнаружения пиров остановлена")
-    
-    async def _discover_initial_peers(self):
-        """Выполняет начальное обнаружение пиров через bootstrap-узлы"""
-        if not self.bootstrap_nodes:
-            logger.warning("Нет доступных bootstrap-узлов для обнаружения пиров")
-            return
+        logger.info("Peer discovery service stopped")
         
-        logger.info(f"Начинаю обнаружение пиров через {len(self.bootstrap_nodes)} bootstrap-узлов")
-        
-        # Перемешиваем bootstrap-узлы для равномерного распределения нагрузки
-        bootstrap_nodes = self.bootstrap_nodes.copy()
-        random.shuffle(bootstrap_nodes)
-        
-        for node_addr in bootstrap_nodes:
-            if not self.discovery_running:
-                break
-                
-            # Парсим адрес и порт
+    async def _discovery_loop(self):
+        """Main discovery loop"""
+        while self.is_running:
             try:
-                if ':' in node_addr:
-                    address, port_str = node_addr.split(':')
-                    port = int(port_str)
-                else:
-                    address = node_addr
-                    port = 8080  # Порт по умолчанию
-            except ValueError:
-                logger.warning(f"Некорректный адрес bootstrap-узла: {node_addr}")
-                continue
-            
-            # Проверяем, не пытались ли мы недавно подключиться к этому узлу
-            node_key = f"{address}:{port}"
-            if node_key in self.unreachable_peers:
-                last_attempt = self.unreachable_peers[node_key]
-                if time.time() - last_attempt < 600:  # 10 минут между попытками
-                    logger.debug(f"Пропускаю недоступный узел {node_key}")
-                    continue
-            
-            # Подключаемся к bootstrap-узлу
-            reader, writer = await connect_to_node(address, port)
-            if not reader or not writer:
-                # Запоминаем недоступный узел
-                self.unreachable_peers[node_key] = time.time()
-                continue
-            
-            # Создаем идентификатор узла
-            node_id = os.urandom(16).hex()
-            
-            # Инициализируем соединение
-            connection = NodeConnection(node_id, reader, writer, outgoing=True)
-            connection.message_callback = self.message_handler
-            
-            # Запускаем чтение сообщений
-            asyncio.create_task(connection.start_reading())
-            
-            # Сохраняем соединение
-            self.active_connections[node_id] = connection
-            
-            # Отправляем запрос на получение списка пиров
-            await self._request_peers(connection)
-            
-            # Ограничиваем количество подключений к bootstrap-узлам
-            if len(self.active_connections) >= 3:
+                await self._discover_peers()
+                await asyncio.sleep(self.discovery_interval)
+            except asyncio.CancelledError:
                 break
-        
-        logger.info(f"Начальное обнаружение пиров завершено. Активных соединений: {len(self.active_connections)}")
-    
-    async def _periodic_discovery(self):
-        """Периодически запускает процесс обнаружения новых пиров"""
-        while self.discovery_running:
-            # Ждем указанный интервал
-            await asyncio.sleep(self.discovery_interval)
-            
-            # Проверяем, нужно ли обнаруживать новые пиры
-            if len(self.active_connections) < self.max_peers:
-                # Если у нас уже есть активные соединения, запрашиваем у них новые пиры
-                if self.active_connections:
-                    # Выбираем случайное соединение для запроса
-                    peer_id = random.choice(list(self.active_connections.keys()))
-                    connection = self.active_connections[peer_id]
-                    
-                    # Отправляем запрос на получение списка пиров
-                    await self._request_peers(connection)
-                else:
-                    # Если нет активных соединений, пробуем bootstrap-узлы
-                    await self._discover_initial_peers()
-    
-    async def _connection_maintenance(self):
-        """Выполняет обслуживание соединений (проверка активности, обновление RTT)"""
-        while self.discovery_running:
-            # Ждем указанный интервал
-            await asyncio.sleep(self.maintenance_interval)
-            
-            # Проверяем все активные соединения
-            for peer_id, connection in list(self.active_connections.items()):
-                # Если соединение больше не активно, удаляем его
-                if not connection.connected:
-                    logger.debug(f"Удаление неактивного соединения с {peer_id}")
-                    self.active_connections.pop(peer_id, None)
-                    continue
+            except Exception as e:
+                logger.error(f"Error in discovery loop: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
                 
-                # Проверяем время последней активности
-                if time.time() - connection.last_active > 300:  # 5 минут неактивности
-                    # Отправляем пинг для проверки соединения
+    async def _discover_peers(self):
+        """Discover new peers"""
+        if len(self.known_peers) >= self.max_peers:
+            return
+            
+        try:
+            # Try bootstrap nodes first
+            for bootstrap_node in self.config.bootstrap_nodes:
+                if bootstrap_node not in self.known_peers:
                     try:
-                        await connection.send_ping()
+                        await self._connect_to_peer(bootstrap_node)
                     except Exception as e:
-                        logger.warning(f"Ошибка при отправке пинга узлу {peer_id}: {e}")
-                        # Закрываем соединение, если не удалось отправить пинг
-                        await connection.close()
-                        self.active_connections.pop(peer_id, None)
-    
-    async def _request_peers(self, connection):
-        """
-        Отправляет запрос на получение списка пиров
-        
-        Args:
-            connection: Соединение с узлом
-        """
-        message = {
-            "type": "get_peers",
-            "id": os.urandom(8).hex(),
-            "timestamp": time.time(),
-            "max_count": 20  # Максимальное количество пиров для получения
-        }
-        
-        await connection.send_message(message)
-    
-    async def handle_get_peers_request(self, message, connection):
-        """
-        Обрабатывает запрос на получение списка пиров
-        
-        Args:
-            message: Сообщение с запросом
-            connection: Соединение с отправителем
-        """
-        max_count = message.get("max_count", 10)
-        
-        # Собираем список известных пиров
-        peers = []
-        for peer_id, peer_info in self.known_peers.items():
-            peers.append({
-                "id": peer_id,
-                "address": peer_info["address"],
-                "port": peer_info["port"],
-                "public_key": peer_info.get("public_key")
+                        logger.warning(f"Failed to connect to bootstrap node {bootstrap_node}: {e}")
+                        
+            # Then try known peers
+            for peer in list(self.known_peers):
+                try:
+                    await self._get_peer_list(peer)
+                except Exception as e:
+                    logger.warning(f"Failed to get peer list from {peer}: {e}")
+                    self.known_peers.remove(peer)
+        except Exception as e:
+            logger.error(f"Error discovering peers: {e}")
+            
+    async def _connect_to_peer(self, peer_address):
+        """Connect to a peer"""
+        if peer_address in self.known_peers:
+            return
+            
+        try:
+            await self.network.connect(peer_address)
+            self.known_peers.add(peer_address)
+            logger.info(f"Connected to peer: {peer_address}")
+        except Exception as e:
+            logger.warning(f"Failed to connect to peer {peer_address}: {e}")
+            raise
+            
+    async def _get_peer_list(self, peer_address):
+        """Get list of peers from a node"""
+        try:
+            response = await self.network.send_message(peer_address, {
+                "type": "get_peers"
             })
             
-            if len(peers) >= max_count:
-                break
-        
-        # Отправляем ответ
-        response = {
-            "type": "peers_list",
-            "id": message.get("id"),
-            "timestamp": time.time(),
-            "peers": peers
-        }
-        
-        await connection.send_message(response)
+            if response and "peers" in response:
+                for peer in response["peers"]:
+                    if peer not in self.known_peers and len(self.known_peers) < self.max_peers:
+                        await self._connect_to_peer(peer)
+        except Exception as e:
+            logger.warning(f"Failed to get peer list from {peer_address}: {e}")
+            raise
     
-    async def handle_peers_list(self, message, connection):
-        """
-        Обрабатывает полученный список пиров
-        
-        Args:
-            message: Сообщение со списком пиров
-            connection: Соединение с отправителем
-        """
-        peers = message.get("peers", [])
-        
-        logger.debug(f"Получен список из {len(peers)} пиров")
-        
-        # Обрабатываем полученные пиры
-        for peer in peers:
-            peer_id = peer.get("id")
-            address = peer.get("address")
-            port = peer.get("port")
-            public_key = peer.get("public_key")
-            
-            if not peer_id or not address or not port:
-                continue
-            
-            # Пропускаем уже известные пиры
-            if peer_id in self.known_peers or peer_id in self.active_connections:
-                continue
-            
-            # Сохраняем информацию о пире
-            self.known_peers[peer_id] = {
-                "address": address,
-                "port": port,
-                "public_key": public_key,
-                "last_seen": time.time()
-            }
-            
-            # Пытаемся подключиться к новому пиру, если нам нужны дополнительные соединения
-            if len(self.active_connections) < self.max_peers:
-                asyncio.create_task(self._connect_to_peer(peer_id, address, port))
-    
-    async def _connect_to_peer(self, peer_id, address, port):
-        """
-        Подключается к новому пиру
-        
-        Args:
-            peer_id: Идентификатор пира
-            address: Адрес пира
-            port: Порт пира
-        """
-        # Проверяем, не превышен ли лимит соединений
-        if len(self.active_connections) >= self.max_peers:
-            return
-        
-        # Проверяем, не пытались ли мы недавно подключиться к этому узлу
-        node_key = f"{address}:{port}"
-        if node_key in self.unreachable_peers:
-            last_attempt = self.unreachable_peers[node_key]
-            if time.time() - last_attempt < 600:  # 10 минут между попытками
-                return
-        
-        # Подключаемся к пиру
-        reader, writer = await connect_to_node(address, port)
-        if not reader or not writer:
-            # Запоминаем недоступный узел
-            self.unreachable_peers[node_key] = time.time()
-            return
-        
-        # Инициализируем соединение
-        connection = NodeConnection(peer_id, reader, writer, outgoing=True)
-        connection.message_callback = self.message_handler
-        
-        # Запускаем чтение сообщений
-        asyncio.create_task(connection.start_reading())
-        
-        # Сохраняем соединение
-        self.active_connections[peer_id] = connection
-        
-        logger.info(f"Установлено новое соединение с пиром {peer_id} ({address}:{port})")
-        
-        # Увеличиваем счетчик обнаруженных пиров
-        self.discovered_peers_count += 1
-        
     def get_active_peers(self) -> List[str]:
         """
         Возвращает список активных пиров
@@ -362,7 +133,7 @@ class PeerDiscovery:
         Returns:
             List[str]: Список идентификаторов активных пиров
         """
-        return list(self.active_connections.keys())
+        return list(self.known_peers)
     
     def get_active_connections_count(self) -> int:
         """
@@ -371,7 +142,7 @@ class PeerDiscovery:
         Returns:
             int: Количество активных соединений
         """
-        return len(self.active_connections)
+        return len(self.known_peers)
     
     def get_known_peers_count(self) -> int:
         """
@@ -382,7 +153,7 @@ class PeerDiscovery:
         """
         return len(self.known_peers)
     
-    def select_random_peers(self, count: int) -> List[NodeConnection]:
+    def select_random_peers(self, count: int) -> List[str]:
         """
         Выбирает случайные активные соединения с пирами
         
@@ -390,19 +161,19 @@ class PeerDiscovery:
             count (int): Желаемое количество пиров
             
         Returns:
-            List[NodeConnection]: Список соединений с выбранными пирами
+            List[str]: Список идентификаторов выбранных пиров
         """
-        if not self.active_connections:
+        if not self.known_peers:
             return []
         
-        peer_ids = list(self.active_connections.keys())
+        peer_ids = list(self.known_peers)
         selected_count = min(count, len(peer_ids))
         
         if selected_count == 0:
             return []
             
         selected_ids = random.sample(peer_ids, selected_count)
-        return [self.active_connections[peer_id] for peer_id in selected_ids]
+        return selected_ids
     
     async def load_bootstrap_peers(self):
         """Загружает начальный список пиров с bootstrap-серверов"""
@@ -422,40 +193,10 @@ class PeerDiscovery:
                 
                 # Для простоты добавляем bootstrap-узлы в список известных пиров
                 # В реальной реализации здесь должен быть запрос к API для получения списка пиров
-                self.known_peers[f"bootstrap_{host}_{port}"] = {
-                    "host": host,
-                    "port": port,
-                    "last_seen": time.time(),
-                    "is_bootstrap": True
-                }
+                self.known_peers.add(f"{host}:{port}")
                 
             except Exception as e:
                 logger.warning(f"Ошибка при загрузке пиров с {node_address}: {e}")
-    
-    async def _peer_discovery_loop(self):
-        """Периодически обновляет список пиров"""
-        while self.is_running:
-            try:
-                # Проверяем истечение времени жизни пиров
-                current_time = time.time()
-                for node_id, peer in list(self.known_peers.items()):
-                    # Удаляем пиры, которые не видели более 24 часов
-                    if current_time - peer["last_seen"] > 86400 and not peer.get("is_bootstrap", False):
-                        logger.debug(f"Удаляем устаревший пир {node_id}")
-                        del self.known_peers[node_id]
-                
-                # Обмениваемся списками пиров с другими узлами
-                # В реальной реализации здесь должен быть обмен с подключенными пирами
-                
-                # Ждем перед следующим обновлением
-                await asyncio.sleep(300)  # Каждые 5 минут
-                
-            except asyncio.CancelledError:
-                logger.info("Задача обнаружения пиров отменена")
-                break
-            except Exception as e:
-                logger.error(f"Ошибка в задаче обнаружения пиров: {e}")
-                await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
     
     async def update_peers(self, active_peers: List[str]):
         """
@@ -464,11 +205,7 @@ class PeerDiscovery:
         Args:
             active_peers (List[str]): Список ID активных пиров
         """
-        current_time = time.time()
-        
-        for node_id in active_peers:
-            if node_id in self.known_peers:
-                self.known_peers[node_id]["last_seen"] = current_time
+        self.known_peers.update(active_peers)
     
     async def get_nodes(self, limit: int = 10) -> List[Dict]:
         """
@@ -482,8 +219,8 @@ class PeerDiscovery:
         """
         # Фильтруем и сортируем узлы по времени последнего контакта
         peers = sorted(
-            [{"node_id": node_id, **peer} for node_id, peer in self.known_peers.items()],
-            key=lambda x: x["last_seen"],
+            [{"node_id": node_id} for node_id in self.known_peers],
+            key=lambda x: x["node_id"],
             reverse=True
         )
         
@@ -500,35 +237,16 @@ class PeerDiscovery:
         Returns:
             List[Dict]: Список выбранных узлов
         """
-        # Преобразуем словарь пиров в список
-        peers = list(self.known_peers.values())
+        # Преобразуем множество пиров в список
+        peers = list(self.known_peers)
         
         # Если у нас недостаточно пиров, возвращаем все имеющиеся
         if len(peers) <= count:
-            return peers
+            return [{"node_id": peer} for peer in peers]
             
         # Выбираем случайные узлы
-        return random.sample(peers, count)
-    
-    def get_peer_count(self) -> int:
-        """
-        Возвращает количество известных пиров
-        
-        Returns:
-            int: Количество пиров
-        """
-        return len(self.known_peers) 
-            List[Dict]: Список выбранных узлов
-        """
-        # Преобразуем словарь пиров в список
-        peers = list(self.known_peers.values())
-        
-        # Если у нас недостаточно пиров, возвращаем все имеющиеся
-        if len(peers) <= count:
-            return peers
-            
-        # Выбираем случайные узлы
-        return random.sample(peers, count)
+        selected_peers = random.sample(peers, count)
+        return [{"node_id": peer} for peer in selected_peers]
     
     def get_peer_count(self) -> int:
         """

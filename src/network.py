@@ -183,141 +183,154 @@ class Network:
     Реализует P2P-сеть для обмена сообщениями между узлами
     """
     
-    def __init__(self, config, crypto):
+    def __init__(self, config):
         """
         Инициализирует сетевой модуль
         
         Args:
             config: Объект конфигурации
-            crypto: Объект шифрования
         """
         self.config = config
-        self.crypto = crypto
-        self.connections = []
-        self.is_running = False
+        self.connections = {}
         self.server = None
-        self.on_message = None
+        self.is_running = False
+        self.connection_timeout = 30  # 30 seconds timeout for connections
         
     async def start(self):
         """Start the network server"""
+        if self.is_running:
+            return
+            
         self.is_running = True
-        
-        async def handler(websocket):
-            # Определяем порт из адреса подключения
-            local_port = websocket.local_address[1]
-            remote_port = websocket.remote_address[1]
-            
-            # Если это входящее соединение, используем порт из конфигурации
-            if local_port == self.config.port:
-                for conn in self.connections:
-                    if conn.remote_address.endswith(str(remote_port)):
-                        remote_port = int(conn.remote_address.split(":")[-1])
-                        break
-            
-            remote_address = f"ws://localhost:{remote_port}"
-            connection = NodeConnection(websocket, remote_address)
-            self.connections.append(connection)
-            try:
-                await self._handle_messages(connection)
-            finally:
-                if connection in self.connections:
-                    self.connections.remove(connection)
-                await connection.close()
-        
         self.server = await websockets.serve(
-            handler,
-            'localhost',
+            self._handle_connection,
+            '0.0.0.0',  # Listen on all interfaces
             self.config.port,
-            ping_interval=None,  # Отключаем автоматические пинги
-            ping_timeout=None    # Отключаем таймаут пингов
+            ping_interval=20,  # Send ping every 20 seconds
+            ping_timeout=10,   # Wait 10 seconds for pong
+            close_timeout=5    # Wait 5 seconds for close
         )
+        logger.info(f"Network server started on port {self.config.port}")
         
     async def stop(self):
-        """Stop the network server and close all connections"""
+        """Stop the network server"""
+        if not self.is_running:
+            return
+            
         self.is_running = False
-        for conn in self.connections:
-            await conn.close()
-        self.connections = []
+        
+        # Close all connections
+        for conn in list(self.connections.values()):
+            try:
+                await conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
+                
+        self.connections.clear()
+        
+        # Stop the server
         if self.server:
             self.server.close()
             await self.server.wait_closed()
             
-    async def connect(self, remote_address: str):
-        """Connect to a remote peer"""
+        logger.info("Network server stopped")
+        
+    async def _handle_connection(self, websocket, path):
+        """Handle incoming websocket connection"""
         try:
-            websocket = await websockets.connect(
-                remote_address,
-                ping_interval=None,
-                ping_timeout=None
-            )
-            connection = NodeConnection(websocket, remote_address)
-            self.connections.append(connection)
-            asyncio.create_task(self._handle_messages(connection))
-            return connection
+            async with websocket:
+                # Set connection timeout
+                websocket.timeout = self.connection_timeout
+                
+                # Get peer address
+                peer = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+                
+                # Create connection object
+                conn = P2PConnection(websocket, peer)
+                self.connections[peer] = conn
+                
+                try:
+                    # Handle messages
+                    async for message in websocket:
+                        await self._handle_message(conn, message)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info(f"Connection closed with {peer}")
+                except Exception as e:
+                    logger.error(f"Error handling connection with {peer}: {e}")
+                finally:
+                    # Remove connection
+                    self.connections.pop(peer, None)
         except Exception as e:
-            logger.error(f"Failed to connect to {remote_address}: {e}")
+            logger.error(f"Error in connection handler: {e}")
+            
+    async def _handle_message(self, conn, message):
+        """Handle incoming message"""
+        try:
+            data = json.loads(message)
+            # Process message based on type
+            if data.get("type") == "get_peers":
+                await self._handle_get_peers(conn)
+            # Add other message type handlers here
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid JSON message from {conn.peer}")
+        except Exception as e:
+            logger.error(f"Error handling message from {conn.peer}: {e}")
+            
+    async def _handle_get_peers(self, conn):
+        """Handle get_peers request"""
+        try:
+            # Get list of known peers
+            peers = list(self.connections.keys())
+            
+            # Send response
+            await conn.send_message({
+                "type": "peers_list",
+                "peers": peers
+            })
+        except Exception as e:
+            logger.error(f"Error handling get_peers request: {e}")
+            
+    async def connect(self, peer_address):
+        """Connect to a peer"""
+        if peer_address in self.connections:
+            return
+            
+        try:
+            # Parse address
+            host, port = peer_address.split(':')
+            port = int(port)
+            
+            # Connect with timeout
+            websocket = await websockets.connect(
+                f"ws://{host}:{port}",
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5
+            )
+            
+            # Create connection object
+            conn = P2PConnection(websocket, peer_address)
+            self.connections[peer_address] = conn
+            
+            # Start message handler
+            asyncio.create_task(self._handle_connection(websocket, None))
+            
+            logger.info(f"Connected to peer: {peer_address}")
+        except Exception as e:
+            logger.warning(f"Failed to connect to {peer_address}: {e}")
             raise
             
-    async def send_message(self, remote_address: str, message: str):
-        """Send a message to a specific peer"""
-        for conn in self.connections:
-            if conn.remote_address == remote_address:
-                try:
-                    # Отправляем сообщение как есть, без дополнительного шифрования
-                    await conn.send(message)
-                    return
-                except Exception as e:
-                    logger.error(f"Error sending message: {e}")
-                    raise
-        raise Exception(f"No connection found for {remote_address}")
-        
-    async def _handle_messages(self, connection):
-        """Handle messages from a connection"""
+    async def send_message(self, peer_address, message):
+        """Send message to peer"""
+        conn = self.connections.get(peer_address)
+        if not conn:
+            raise ConnectionError(f"No connection to {peer_address}")
+            
         try:
-            async for message in connection:
-                logger.info(f"Received message: {message}")
-                if self.on_message:
-                    try:
-                        data = json.loads(message)
-                        logger.info(f"Parsed JSON: {data}")
-                        if data.get("type") == "onion":
-                            logger.info("Processing onion message")
-                            
-                            # Process the onion layer
-                            try:
-                                # Call message handler to process the layer
-                                await self.on_message(connection, message)
-                                
-                                # Если есть другие соединения, пересылаем сообщение первому из них
-                                other_connections = [c for c in self.connections if c != connection]
-                                if other_connections:
-                                    next_hop = other_connections[0]
-                                    logger.info(f"Forwarding onion message to {next_hop.remote_address}")
-                                    await next_hop.send(message)
-                                else:
-                                    logger.info("This is the final hop, processing message")
-                            except Exception as e:
-                                logger.error(f"Error processing onion layer: {e}")
-                                raise
-                        else:
-                            # Regular message
-                            logger.info("Processing regular message")
-                            await self.on_message(connection, message)
-                    except json.JSONDecodeError:
-                        # Not a JSON message, treat as regular message
-                        logger.info("Processing non-JSON message")
-                        await self.on_message(connection, message)
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}")
-                        raise
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Connection closed: {connection.remote_address}")
+            await conn.send_message(message)
         except Exception as e:
-            logger.error(f"Error handling messages: {e}")
-        finally:
-            if connection in self.connections:
-                self.connections.remove(connection)
-            await connection.close()
+            logger.error(f"Error sending message to {peer_address}: {e}")
+            raise
         
     def set_message_handler(self, handler):
         """Set the message handler"""
