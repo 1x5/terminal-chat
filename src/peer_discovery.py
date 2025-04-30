@@ -66,15 +66,16 @@ class PeerDiscovery:
         # Загружаем начальный список пиров
         await self.load_bootstrap_peers()
         
-        # Запускаем периодическое обновление списка пиров
-        asyncio.create_task(self._peer_discovery_loop())
-        
         # Запускаем основные задачи
-        asyncio.create_task(self._periodic_discovery())
-        asyncio.create_task(self._connection_maintenance())
+        self.discovery_task = asyncio.create_task(self._peer_discovery_loop())
+        self.maintenance_task = asyncio.create_task(self._connection_maintenance())
+        self.periodic_task = asyncio.create_task(self._periodic_discovery())
         
         # Выполняем начальное обнаружение пиров
         await self._discover_initial_peers()
+        
+        # Устанавливаем running в True
+        self.running = True
         
         logger.info("Система обнаружения пиров запущена")
         
@@ -93,6 +94,25 @@ class PeerDiscovery:
         if self.session:
             await self.session.close()
             self.session = None
+            
+        # Отменяем все задачи
+        tasks = []
+        for task_name in ['discovery_task', 'maintenance_task', 'periodic_task']:
+            if hasattr(self, task_name) and getattr(self, task_name):
+                task = getattr(self, task_name)
+                task.cancel()
+                tasks.append(task)
+                setattr(self, task_name, None)
+                
+        # Ждем завершения всех задач
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+            
+        # Устанавливаем running в False
+        self.running = False
             
         logger.info("Система обнаружения пиров остановлена")
     

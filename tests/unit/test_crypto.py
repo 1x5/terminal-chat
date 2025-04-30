@@ -3,10 +3,13 @@
 """
 
 import pytest
+import asyncio
+import time
 from src.crypto import (
     CryptoManager, generate_keypair, load_keypair, generate_onion_layers,
     wrap_in_onion_layers, unwrap_onion_layer
 )
+from nacl.public import PrivateKey, PublicKey
 
 def test_keypair_generation():
     """Проверяет генерацию пары ключей"""
@@ -219,4 +222,106 @@ def test_short_route():
     
     # Разворачиваем
     unwrapped = unwrap_onion_layer(wrapped, load_keypair(node_keypair)[0])
-    assert unwrapped == message 
+    assert unwrapped == message
+
+@pytest.fixture
+def crypto_manager():
+    """Create a crypto manager instance"""
+    manager = CryptoManager()
+    private_key = PrivateKey.generate()
+    manager.set_private_key(private_key)
+    return manager
+
+@pytest.mark.asyncio
+async def test_group_encryption(crypto_manager):
+    """Test group message encryption/decryption"""
+    group_id = "test_group"
+    message = "Hello group!"
+    
+    # Encrypt message
+    encrypted = crypto_manager.encrypt_group_message(message, group_id)
+    assert encrypted != message
+    
+    # Decrypt message
+    decrypted = crypto_manager.decrypt_group_message(encrypted, group_id)
+    assert decrypted == message
+
+@pytest.mark.asyncio
+async def test_group_key_rotation(crypto_manager):
+    """Test group key rotation"""
+    group_id = "test_group"
+    
+    # Generate initial key
+    key1 = crypto_manager.get_group_key(group_id)
+    
+    # Force key rotation
+    await crypto_manager._rotate_keys()
+    
+    # Get new key
+    key2 = crypto_manager.get_group_key(group_id)
+    
+    # Keys should be different
+    assert key1 != key2
+
+@pytest.mark.asyncio
+async def test_group_message_after_rotation(crypto_manager):
+    """Test that messages can't be decrypted with old keys after rotation"""
+    group_id = "test_group"
+    message = "Secret message"
+    
+    # Encrypt with old key
+    encrypted = crypto_manager.encrypt_group_message(message, group_id)
+    
+    # Rotate keys
+    await crypto_manager._rotate_keys()
+    
+    # Try to decrypt with new key (should fail)
+    with pytest.raises(Exception):
+        crypto_manager.decrypt_group_message(encrypted, group_id)
+
+@pytest.mark.asyncio
+async def test_multiple_groups(crypto_manager):
+    """Test handling multiple groups"""
+    groups = ["group1", "group2", "group3"]
+    message = "Group message"
+    
+    # Encrypt for each group
+    encrypted_messages = {}
+    for group_id in groups:
+        encrypted_messages[group_id] = crypto_manager.encrypt_group_message(message, group_id)
+    
+    # Verify each message can only be decrypted by its group
+    for group_id in groups:
+        # Should decrypt successfully
+        decrypted = crypto_manager.decrypt_group_message(encrypted_messages[group_id], group_id)
+        assert decrypted == message
+        
+        # Try to decrypt with wrong group (should fail)
+        wrong_group = next(g for g in groups if g != group_id)
+        with pytest.raises(Exception):
+            crypto_manager.decrypt_group_message(encrypted_messages[group_id], wrong_group)
+
+@pytest.mark.asyncio
+async def test_key_rotation_interval(crypto_manager):
+    """Test that keys are rotated at the correct interval"""
+    # Initialize the crypto manager
+    await crypto_manager.init()
+    
+    # Set short interval for testing
+    crypto_manager.key_rotation_interval = 1  # 1 second
+    
+    # Get initial key
+    group_id = "test_group"
+    key1 = crypto_manager.get_group_key(group_id)
+    
+    # Wait for rotation
+    await asyncio.sleep(1.1)
+    
+    # Get new key
+    key2 = crypto_manager.get_group_key(group_id)
+    
+    # Keys should be different
+    assert key1 != key2
+    
+    # Cleanup
+    await crypto_manager.stop() 

@@ -11,130 +11,172 @@ import json
 import socket
 import time
 import random
-from typing import Dict, List, Any, Optional, Callable, Set, Tuple
+from typing import Dict, List, Any, Optional, Callable, Set, Tuple, Awaitable
 import websockets
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import (
+    WebSocketException, ConnectionClosed, ConnectionClosedError,
+    ConnectionClosedOK, InvalidStatusCode, InvalidMessage
+)
+from websockets.client import WebSocketClientProtocol
+from websockets.server import WebSocketServerProtocol
 
 from src.p2p_connection import NodeConnection
+from src.protocol import (
+    Message, MessageType, HandshakeMessage, OnionMessage,
+    PingMessage, PongMessage, ErrorMessage, RouteUpdateMessage,
+    NodeInfoMessage
+)
+from src.crypto import CryptoManager
+from src.security import SecurityManager
 
 logger = logging.getLogger("securetermchat.network")
 
+class NetworkError(Exception):
+    """Базовый класс для сетевых ошибок"""
+    pass
+
+class ConnectionError(NetworkError):
+    """Ошибка установки соединения"""
+    pass
+
+class MessageError(NetworkError):
+    """Ошибка обработки сообщения"""
+    pass
+
 class P2PConnection:
-    """
-    Реализует P2P-соединение между двумя узлами
-    """
+    """P2P соединение для обмена сообщениями"""
     
-    def __init__(self, host: str, port: int):
-        """
-        Инициализирует P2P-соединение
-        
-        Args:
-            host (str): Хост для прослушивания
-            port (int): Порт для прослушивания
-        """
+    def __init__(self, host: str, port: int, node_id: str, public_key: str,
+                 crypto_manager: CryptoManager, security_manager: SecurityManager):
         self.host = host
         self.port = port
-        self.websocket = None
-        self.is_running = False
-        self.message_queue = asyncio.Queue()
-        self.remote_address = None
+        self.node_id = node_id
+        self.public_key = public_key
+        self.crypto = crypto_manager
+        self.security = security_manager
+        self.websocket: Optional[WebSocketClientProtocol] = None
+        self.connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.reconnect_delay = 1.0
+        self.message_handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]] = {}
+        self.server = None
+        self.connection_state = "disconnected"
+        self.error_count = 0
+        self.max_errors = 3
+        self.last_ping_time = None
         
-    async def start(self):
-        """Запускает прослушивание входящих соединений"""
-        self.is_running = True
-        self.server = await websockets.serve(
-            self._handle_connection,
-            self.host,
-            self.port
-        )
-        logger.info(f"P2P-соединение запущено на {self.host}:{self.port}")
-        
-    async def stop(self):
+    async def connect(self) -> None:
+        """Устанавливает соединение с узлом"""
+        try:
+            uri = f"ws://{self.host}:{self.port}"
+            self.websocket = await websockets.connect(uri)
+            self.connected = True
+            self.connection_state = "connected"
+            self.reconnect_attempts = 0
+            self.error_count = 0
+            logger.info(f"Connected to {uri}")
+            
+            # Запускаем обработку сообщений
+            asyncio.create_task(self._handle_messages())
+            
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            self.connected = False
+            self.connection_state = "disconnected"
+            self.error_count += 1
+            if self.error_count < self.max_errors:
+                await self._handle_connection_error()
+            
+    async def _handle_connection_error(self) -> None:
+        """Обрабатывает ошибки соединения"""
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            self.reconnect_attempts += 1
+            delay = self.reconnect_delay * (2 ** (self.reconnect_attempts - 1))
+            logger.info(f"Reconnecting in {delay} seconds...")
+            await asyncio.sleep(delay)
+            await self.connect()
+        else:
+            logger.error(f"Превышено максимальное количество попыток переподключения ({self.max_reconnect_attempts})")
+            self.connection_state = "disconnected"
+            
+    async def _handle_messages(self) -> None:
+        """Обрабатывает входящие сообщения"""
+        if not self.websocket:
+            return
+            
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    message_type = data.get("type")
+                    
+                    if message_type in self.message_handlers:
+                        await self.message_handlers[message_type](data)
+                    else:
+                        logger.warning(f"Unknown message type: {message_type}")
+                        
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON message")
+                except Exception as e:
+                    logger.error(f"Error handling message: {e}")
+                    
+        except ConnectionClosedOK:
+            logger.info("Connection closed normally")
+        except ConnectionClosedError as e:
+            logger.error(f"Connection closed with error: {e}")
+        finally:
+            self.connected = False
+            self.connection_state = "disconnected"
+            if self.error_count < self.max_errors:
+                await self._handle_connection_error()
+            
+    async def send_message(self, message_type: str, data: Dict[str, Any]) -> None:
+        """Отправляет сообщение"""
+        if not self.connected or not self.websocket:
+            raise ConnectionError("Not connected")
+            
+        try:
+            message = {
+                "type": message_type,
+                "data": data
+            }
+            await self.websocket.send(json.dumps(message))
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            raise
+            
+    async def ping(self) -> None:
+        """Отправляет пинг для проверки соединения"""
+        if not self.connected or not self.websocket:
+            return
+            
+        try:
+            await self.send_message("ping", {"timestamp": time.time()})
+            self.last_ping_time = time.time()
+        except Exception as e:
+            logger.error(f"Error sending ping: {e}")
+            self.error_count += 1
+            if self.error_count < self.max_errors:
+                await self._handle_connection_error()
+            
+    async def stop(self) -> None:
         """Останавливает соединение"""
-        self.is_running = False
         if self.websocket:
             await self.websocket.close()
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-        logger.info("P2P-соединение остановлено")
-        
-    async def connect(self, host: str, port: int):
-        """
-        Устанавливает соединение с удаленным узлом
-        
-        Args:
-            host (str): Хост удаленного узла
-            port (int): Порт удаленного узла
-        """
-        try:
-            self.websocket = await websockets.connect(f"ws://{host}:{port}")
-            self.remote_address = (host, port)
-            logger.info(f"Установлено соединение с {host}:{port}")
-        except Exception as e:
-            logger.error(f"Ошибка при установке соединения с {host}:{port}: {e}")
-            raise
-            
-    def is_connected(self) -> bool:
-        """
-        Проверяет, установлено ли соединение
-        
-        Returns:
-            bool: True если соединение установлено
-        """
-        return self.websocket is not None and not self.websocket.closed
-        
-    async def send_message(self, message: str):
-        """
-        Отправляет сообщение
-        
-        Args:
-            message (str): Текст сообщения
-        """
-        if not self.is_connected():
-            raise Exception("Соединение не установлено")
-            
-        try:
-            await self.websocket.send(message)
-        except Exception as e:
-            logger.error(f"Ошибка при отправке сообщения: {e}")
-            raise
-            
-    async def receive_message(self) -> str:
-        """
-        Получает сообщение
-        
-        Returns:
-            str: Текст сообщения
-        """
-        if not self.is_connected():
-            raise Exception("Соединение не установлено")
-            
-        try:
-            return await self.websocket.recv()
-        except Exception as e:
-            logger.error(f"Ошибка при получении сообщения: {e}")
-            raise
-            
-    async def _handle_connection(self, websocket, path):
-        """
-        Обрабатывает входящее соединение
-        
-        Args:
-            websocket: WebSocket-соединение
-            path: Путь запроса
-        """
-        self.websocket = websocket
-        self.remote_address = websocket.remote_address
-        logger.info(f"Получено входящее соединение от {self.remote_address}")
-        
-        try:
-            async for message in websocket:
-                await self.message_queue.put(message)
-        except Exception as e:
-            logger.error(f"Ошибка при обработке входящего соединения: {e}")
-        finally:
-            await self.stop()
+        self.connected = False
+        self.connection_state = "disconnected"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.stop()
+        return None
+
+    async def init(self):
+        """Initialize any async resources"""
+        pass  # Add async initialization if needed
 
 class P2PNetwork:
     """

@@ -3,14 +3,18 @@
 """
 import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock
-from src.network import P2PNetwork
+from unittest.mock import Mock, AsyncMock, patch
+from src.network import P2PNetwork, P2PConnection
 from src.p2p_connection import NodeConnection
 from src.crypto import CryptoManager
 import pytest_asyncio
 from dataclasses import dataclass
 import random
 from src.config import Config
+from websockets.client import WebSocketClientProtocol
+from websockets.server import WebSocketServerProtocol
+from src.security import SecurityManager
+import json
 
 class MockConfig:
     def __init__(self):
@@ -63,6 +67,30 @@ async def network_pair():
     # Cleanup
     await network1.stop()
     await network2.stop()
+
+@pytest_asyncio.fixture
+async def crypto_manager():
+    """Создает тестовый менеджер криптографии"""
+    return CryptoManager()
+
+@pytest_asyncio.fixture
+async def security_manager(crypto_manager):
+    """Создает тестовый менеджер безопасности"""
+    return SecurityManager(crypto_manager)
+
+@pytest_asyncio.fixture
+async def connection(crypto_manager, security_manager):
+    """Создает тестовое соединение"""
+    conn = P2PConnection(
+        host="localhost",
+        port=8000,
+        node_id="test_node",
+        public_key="test_key",
+        crypto_manager=crypto_manager,
+        security_manager=security_manager
+    )
+    yield conn
+    await conn.stop()
 
 @pytest.mark.asyncio
 async def test_connection_establishment(network_pair):
@@ -195,4 +223,95 @@ async def test_multiple_connections(network_pair):
     assert len(network3.connections) == 2
     
     # Cleanup
-    await network3.stop() 
+
+@pytest.mark.asyncio
+async def test_connection_error_handling(connection):
+    """Тест обработки ошибок соединения"""
+    with patch('websockets.connect', side_effect=ConnectionError("Test error")):
+        await connection.connect()
+        assert connection.connection_state == "disconnected"
+        assert connection.error_count == 1
+
+@pytest.mark.asyncio
+async def test_connection_recovery(connection):
+    """Тест восстановления соединения"""
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.send = AsyncMock()
+    mock_ws.recv = AsyncMock(return_value=json.dumps({"type": "handshake", "data": {}}))
+    
+    with patch('websockets.connect', side_effect=[ConnectionError("Test error"), mock_ws]):
+        await connection.connect()
+        assert connection.connection_state == "connected"
+        assert connection.error_count == 0
+
+@pytest.mark.asyncio
+async def test_max_reconnect_attempts(connection):
+    """Тест максимального количества попыток переподключения"""
+    connection.max_reconnect_attempts = 2
+    
+    with patch('websockets.connect', side_effect=ConnectionError("Test error")):
+        await connection.connect()
+        await connection.connect()
+        assert connection.reconnect_attempts == 2
+        assert connection.connection_state == "disconnected"
+
+@pytest.mark.asyncio
+async def test_message_error_handling(connection):
+    """Тест обработки ошибок сообщений"""
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.send = AsyncMock(side_effect=Exception("Test error"))
+    
+    with patch('websockets.connect', return_value=mock_ws):
+        await connection.connect()
+        with pytest.raises(Exception):
+            await connection.send_message("test", {"data": "test"})
+
+@pytest.mark.asyncio
+async def test_connection_state_transitions(connection):
+    """Тест переходов состояний соединения"""
+    assert connection.connection_state == "disconnected"
+    
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.send = AsyncMock()
+    mock_ws.recv = AsyncMock(return_value=json.dumps({"type": "handshake", "data": {}}))
+    
+    with patch('websockets.connect', return_value=mock_ws):
+        await connection.connect()
+        assert connection.connection_state == "connected"
+        
+        await connection.stop()
+        assert connection.connection_state == "disconnected"
+
+@pytest.mark.asyncio
+async def test_connection_monitoring(connection):
+    """Тест мониторинга соединения"""
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.send = AsyncMock()
+    mock_ws.recv = AsyncMock(return_value=json.dumps({"type": "handshake", "data": {}}))
+    
+    with patch('websockets.connect', return_value=mock_ws):
+        await connection.connect()
+        await connection.ping()
+        assert connection.last_ping_time is not None
+
+@pytest.mark.asyncio
+async def test_ping_pong_error_handling(connection):
+    """Тест обработки ошибок пинг-понг"""
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.send = AsyncMock(side_effect=Exception("Test error"))
+    
+    with patch('websockets.connect', return_value=mock_ws):
+        await connection.connect()
+        await connection.ping()
+        assert connection.connection_state == "disconnected"
+
+@pytest.mark.asyncio
+async def test_connection_cleanup(connection):
+    """Тест очистки соединения"""
+    mock_ws = AsyncMock(spec=WebSocketClientProtocol)
+    mock_ws.close = AsyncMock()
+    
+    with patch('websockets.connect', return_value=mock_ws):
+        await connection.connect()
+        await connection.stop()
+        mock_ws.close.assert_called_once()

@@ -9,8 +9,11 @@ import os
 import json
 import base64
 import logging
-from typing import Dict, Tuple, Optional, Any, Union
+import time
+import asyncio
+from typing import Dict, Tuple, Optional, Any, Union, List
 from datetime import datetime
+import hashlib
 
 import nacl.utils
 import nacl.secret
@@ -26,52 +29,157 @@ class CryptoManager:
     
     def __init__(self):
         """Initialize the crypto manager"""
-        self.private_key = None
-        self.public_key = None
-        self.boxes = {}  # Cache for encryption boxes
+        private_key = PrivateKey.generate()
+        self.private_key = private_key
+        self.public_key = private_key.public_key
+        self.contact_keys = {}  # contact_id -> PublicKey
+        self.encryption_boxes = {}  # contact_id -> Box
+        self.group_keys = {}  # group_id -> (key, timestamp)
+        self.key_rotation_interval = 3600  # 1 hour
+        self.last_key_rotation = time.time()
         
+    async def init(self):
+        """Initialize any async resources"""
+        if not self.private_key:
+            keypair = generate_keypair()
+            self.private_key, self.public_key = load_keypair(keypair)
+        # Start key rotation
+        self._rotation_task = asyncio.create_task(self._key_rotation_loop())
+        
+    async def stop(self):
+        """Stop the crypto manager"""
+        if hasattr(self, '_rotation_task'):
+            self._rotation_task.cancel()
+            try:
+                await self._rotation_task
+            except asyncio.CancelledError:
+                pass
+
     def set_private_key(self, private_key: PrivateKey):
         """Set the private key for this node"""
         self.private_key = private_key
         self.public_key = private_key.public_key
         
-    def get_box_for_peer(self, peer_public_key: PublicKey) -> Box:
-        """Get or create a Box for communication with a peer"""
-        if peer_public_key not in self.boxes:
-            self.boxes[peer_public_key] = Box(self.private_key, peer_public_key)
-        return self.boxes[peer_public_key]
+    def get_public_key(self) -> PublicKey:
+        """Get the public key for this node"""
+        return self.public_key
         
-    def encrypt(self, message: str, peer_public_key: PublicKey = None) -> str:
-        """Encrypt a message"""
-        if isinstance(message, dict):
-            message = json.dumps(message)
+    def add_contact_key(self, contact_id: str, public_key_or_b64: Union[str, PublicKey]):
+        """Add a contact's public key"""
+        try:
+            if isinstance(public_key_or_b64, str):
+                public_key = PublicKey(base64.b64decode(public_key_or_b64))
+            else:
+                public_key = public_key_or_b64
+                
+            self.contact_keys[contact_id] = public_key
+            self.encryption_boxes[contact_id] = Box(self.private_key, public_key)
+        except Exception as e:
+            raise Exception(f"Invalid public key: {e}")
             
-        if peer_public_key:
-            box = self.get_box_for_peer(peer_public_key)
-        else:
-            # For backward compatibility, use secret box
-            box = nacl.secret.SecretBox(self.private_key.encode())
+    def remove_contact_key(self, contact_id: str):
+        """Remove a contact's key"""
+        if contact_id in self.contact_keys:
+            del self.contact_keys[contact_id]
+        if contact_id in self.encryption_boxes:
+            del self.encryption_boxes[contact_id]
             
+    def encrypt_message(self, message: str, recipient_id: str) -> str:
+        """Encrypt a message for a specific recipient"""
+        if recipient_id not in self.contact_keys:
+            raise ValueError(f"Нет ключа для контакта {recipient_id}")
+            
+        box = self.encryption_boxes[recipient_id]
         nonce = nacl.utils.random(Box.NONCE_SIZE)
         encrypted = box.encrypt(message.encode(), nonce)
         return base64.b64encode(encrypted).decode()
         
-    def decrypt(self, encrypted: str, peer_public_key: PublicKey = None) -> str:
+    def decrypt_message(self, encrypted: str) -> str:
         """Decrypt a message"""
         try:
             encrypted_bytes = base64.b64decode(encrypted)
-            
-            if peer_public_key:
-                box = self.get_box_for_peer(peer_public_key)
-            else:
-                # For backward compatibility, use secret box
-                box = nacl.secret.SecretBox(self.private_key.encode())
-                
+            # Try each contact's box
+            for box in self.encryption_boxes.values():
+                try:
+                    decrypted = box.decrypt(encrypted_bytes)
+                    return decrypted.decode()
+                except:
+                    continue
+            raise Exception("Could not decrypt message with any known key")
+        except Exception as e:
+            raise Exception(f"Error decrypting message: {e}")
+
+    def generate_group_key(self, group_id: str) -> str:
+        """Generate a new key for a group"""
+        key = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
+        self.group_keys[group_id] = (key, time.time())
+        return base64.b64encode(key).decode()
+
+    def get_group_key(self, group_id: str) -> Optional[bytes]:
+        """Get group key for a specific group."""
+        return self.group_keys.get(group_id)
+
+    def encrypt_group_message(self, message: str, group_id: str) -> str:
+        """Encrypt a message for a group"""
+        key = self.get_group_key(group_id)
+        box = nacl.secret.SecretBox(key)
+        nonce = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
+        encrypted = box.encrypt(message.encode(), nonce)
+        return base64.b64encode(encrypted).decode()
+
+    def decrypt_group_message(self, encrypted: str, group_id: str) -> str:
+        """Decrypt a message from a group"""
+        try:
+            encrypted_bytes = base64.b64decode(encrypted)
+            key = self.get_group_key(group_id)
+            box = nacl.secret.SecretBox(key)
             decrypted = box.decrypt(encrypted_bytes)
             return decrypted.decode()
         except Exception as e:
-            logger.error(f"Error decrypting message: {e}")
-            raise
+            raise Exception(f"Error decrypting group message: {e}")
+
+    async def _key_rotation_loop(self):
+        """Background task for key rotation"""
+        while True:
+            try:
+                now = time.time()
+                if now - self.last_key_rotation >= self.key_rotation_interval:
+                    await self._rotate_keys()
+                    self.last_key_rotation = now
+                await asyncio.sleep(0.1)  # Check more frequently for tests
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in key rotation: {e}")
+                await asyncio.sleep(5)
+
+    async def _rotate_keys(self):
+        """Rotate all keys"""
+        # Rotate group keys
+        for group_id in list(self.group_keys.keys()):
+            key = nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
+            self.group_keys[group_id] = (key, time.time())
+            
+        # Clear box cache to force regeneration
+        self.encryption_boxes.clear()
+        
+        logger.info("Keys rotated successfully")
+
+    def generate_ephemeral_key(self) -> bytes:
+        """Generate a new ephemeral key for challenge-response."""
+        return nacl.utils.random(nacl.secret.SecretBox.KEY_SIZE)
+
+    def generate_random_bytes(self, size: int) -> bytes:
+        """Генерирует случайные байты заданного размера"""
+        return nacl.utils.random(size)
+
+    def hash(self, data: bytes) -> bytes:
+        """Вычисляет хеш данных"""
+        return hashlib.sha256(data).digest()
+
+class CryptoError(Exception):
+    """Custom exception for crypto-related errors."""
+    pass
 
 def generate_keypair() -> Dict[str, str]:
     """
@@ -190,120 +298,51 @@ def generate_onion_layers(hops: int) -> Dict[str, Any]:
     
     return layers
 
-def wrap_in_onion_layers(message: Dict[str, str], route_public_keys: list) -> Dict[str, str]:
-    """
-    Оборачивает сообщение в слои шифрования для луковой маршрутизации
-    
-    Args:
-        message (Dict[str, str]): Исходное зашифрованное сообщение
-        route_public_keys (list): Список публичных ключей узлов маршрута (в прямом порядке)
-        
-    Returns:
-        Dict[str, str]: Сообщение, обернутое в слои шифрования
-    """
-    logger.info(f"Wrapping message: {message}")
-    logger.info(f"Route public keys: {route_public_keys}")
-    
-    # Начинаем с конечного сообщения
-    current_layer = message
-    logger.info(f"Initial layer: {current_layer}")
-    
-    # Добавляем слои шифрования в прямом порядке
-    for i, pubkey_b64 in enumerate(route_public_keys):
-        logger.info(f"Processing hop {i}")
-        try:
-            # Decode public key
-            pubkey_bytes = base64.b64decode(pubkey_b64)
-            logger.info(f"Decoded public key bytes (len={len(pubkey_bytes)}): {pubkey_bytes.hex()[:32]}...")
-            pubkey = PublicKey(pubkey_bytes)
-            logger.info(f"Created PublicKey object: {base64.b64encode(pubkey.encode()).decode()}")
-            
-            # Генерируем временный ключ для этого слоя
-            ephemeral_key = PrivateKey.generate()
-            ephemeral_pubkey = ephemeral_key.public_key
-            logger.info(f"Generated ephemeral key pair:")
-            logger.info(f"  private (len={len(ephemeral_key.encode())}): {base64.b64encode(ephemeral_key.encode()).decode()}")
-            logger.info(f"  public (len={len(ephemeral_pubkey.encode())}): {base64.b64encode(ephemeral_pubkey.encode()).decode()}")
-            
-            # Создаем Box для шифрования
-            box = Box(pubkey, ephemeral_key)
-            logger.info("Created Box for encryption")
-            
-            # Шифруем текущий слой
-            layer_json = json.dumps(current_layer)
-            logger.info(f"Layer to encrypt (len={len(layer_json)}): {layer_json}")
-            layer_bytes = layer_json.encode('utf-8')
-            logger.info(f"Layer bytes (len={len(layer_bytes)}): {layer_bytes.hex()[:64]}...")
-            
-            # Шифруем данные
-            encrypted = box.encrypt(layer_bytes)
-            logger.info(f"Encrypted data:")
-            logger.info(f"  nonce (len={len(encrypted.nonce)}): {encrypted.nonce.hex()}")
-            logger.info(f"  ciphertext (len={len(encrypted.ciphertext)}): {encrypted.ciphertext.hex()[:64]}...")
-            
-            # Формируем новый слой
-            current_layer = {
-                "nonce": base64.b64encode(encrypted.nonce).decode('utf-8'),
-                "ciphertext": base64.b64encode(encrypted.ciphertext).decode('utf-8'),
-                "ephemeral_pubkey": base64.b64encode(ephemeral_pubkey.encode()).decode('utf-8')
-            }
-            logger.info(f"Created layer {i}:")
-            logger.info(f"  nonce (len={len(current_layer['nonce'])}): {current_layer['nonce']}")
-            logger.info(f"  ciphertext (len={len(current_layer['ciphertext'])}): {current_layer['ciphertext'][:64]}...")
-            logger.info(f"  ephemeral_pubkey (len={len(current_layer['ephemeral_pubkey'])}): {current_layer['ephemeral_pubkey']}")
-        except Exception as e:
-            logger.error(f"Error in wrap_in_onion_layers at hop {i}: {e}")
-            raise
-    
-    return current_layer
-
-class CryptoError(Exception):
-    """Custom exception for crypto-related errors."""
-    pass
-
-def unwrap_onion_layer(layer: Dict[str, str], node_private_key: PrivateKey) -> Dict[str, Any]:
-    """Unwrap a single layer of an onion message."""
+def wrap_in_onion_layers(message: dict, node_public_keys: list) -> dict:
+    """Wrap a message in onion layers for routing"""
     try:
-        logger.info(f"Unwrapping layer: {layer}")
-        logger.info(f"Node private key type: {type(node_private_key)}")
-        logger.info(f"Node private key bytes: {base64.b64encode(node_private_key.encode()).decode()}")
-        logger.info(f"Node public key bytes: {base64.b64encode(node_private_key.public_key.encode()).decode()}")
-        
-        # Decode the layer components
-        logger.info(f"Raw nonce: {layer['nonce']}")
-        logger.info(f"Raw ciphertext: {layer['ciphertext'][:64]}...")
-        logger.info(f"Raw ephemeral_pubkey: {layer['ephemeral_pubkey']}")
-        
-        nonce = base64.b64decode(layer['nonce'])
-        ciphertext = base64.b64decode(layer['ciphertext'])
-        ephemeral_pubkey = base64.b64decode(layer['ephemeral_pubkey'])
-        
-        logger.info(f"Decoded nonce (len={len(nonce)}): {base64.b64encode(nonce).decode()}")
-        logger.info(f"Decoded ciphertext (len={len(ciphertext)}): {base64.b64encode(ciphertext).decode()[:64]}...")
-        logger.info(f"Decoded ephemeral pubkey bytes (len={len(ephemeral_pubkey)}): {base64.b64encode(ephemeral_pubkey).decode()}")
-        
-        # Create the ephemeral public key object
-        ephemeral_pubkey_obj = PublicKey(ephemeral_pubkey)
-        logger.info(f"Created ephemeral PublicKey object type: {type(ephemeral_pubkey_obj)}")
-        logger.info(f"Ephemeral PublicKey bytes: {base64.b64encode(ephemeral_pubkey_obj.encode()).decode()}")
-        
-        # Создаем Box для расшифровки
-        logger.info(f"Creating Box for decryption with node private key and ephemeral public key")
-        logger.info(f"Node private key type: {type(node_private_key)}")
-        logger.info(f"Ephemeral public key type: {type(ephemeral_pubkey_obj)}")
-        box = Box(node_private_key, ephemeral_pubkey_obj)
-        logger.info("Created Box for decryption")
-        
-        # Decrypt the message
-        decrypted = box.decrypt(ciphertext, nonce)
-        logger.info(f"Decrypted message (len={len(decrypted)}): {base64.b64encode(decrypted).decode()}")
-        
-        # Parse the decrypted message
-        message = json.loads(decrypted)
-        logger.info(f"Parsed message: {message}")
-        
-        return message
-        
+        current_layer = message
+        for pubkey_b64 in reversed(node_public_keys):
+            # Generate ephemeral key pair for this hop
+            ephemeral_private = PrivateKey.generate()
+            ephemeral_public = ephemeral_private.public_key
+            
+            # Decode the node's public key from base64
+            pubkey = PublicKey(base64.b64decode(pubkey_b64))
+            
+            # Create box for encryption
+            box = Box(ephemeral_private, pubkey)
+            
+            # Encrypt the current layer
+            nonce = nacl.utils.random(Box.NONCE_SIZE)
+            encrypted = box.encrypt(json.dumps(current_layer).encode(), nonce)
+            
+            # Create the new layer
+            current_layer = {
+                "ciphertext": base64.b64encode(encrypted).decode(),
+                "next_hop": base64.b64encode(ephemeral_public.encode()).decode()
+            }
+            
+        return current_layer
     except Exception as e:
-        logger.error(f"Error unwrapping layer: {str(e)}")
-        raise CryptoError(f"Failed to unwrap onion layer: {str(e)}") 
+        logger.error(f"Error in wrap_in_onion_layers at hop {len(node_public_keys)}: {e}")
+        raise
+
+def unwrap_onion_layer(layer: dict, private_key: PrivateKey) -> dict:
+    """Unwrap one layer of onion routing"""
+    try:
+        # Extract the ephemeral public key
+        ephemeral_public = PublicKey(base64.b64decode(layer["next_hop"]))
+        
+        # Create box for decryption
+        box = Box(private_key, ephemeral_public)
+        
+        # Decrypt the layer
+        encrypted = base64.b64decode(layer["ciphertext"])
+        decrypted = box.decrypt(encrypted)
+        
+        # Parse the decrypted content
+        return json.loads(decrypted.decode())
+    except Exception as e:
+        logger.error(f"Error unwrapping onion layer: {e}")
+        raise 
