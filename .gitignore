@@ -20,6 +20,25 @@ wheels/
 .installed.cfg
 *.egg
 
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Local data
+.securetermchat/
+data/
+
 # Testing
 .tox/
 .coverage
@@ -31,32 +50,7 @@ coverage.xml
 coverage_html/
 htmlcov/
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
 # Environment
-.env
-.venv
-env/
-venv/
-ENV/
-
-# Project specific
-data/
-logs/
-*.log
-*.db
-*.sqlite3
-
-# Логи установщика
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Окружения
 .env
 .venv
 env/
@@ -75,9 +69,6 @@ venv.bak/
 securetermchat.log
 .securetermchat/
 *.log
-
-# Логи
-debug.log
 
 # Пользовательские данные
 *.json
