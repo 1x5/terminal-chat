@@ -518,3 +518,23 @@ class PeerDiscovery:
             int: Количество пиров
         """
         return len(self.known_peers) 
+            List[Dict]: Список выбранных узлов
+        """
+        # Преобразуем словарь пиров в список
+        peers = list(self.known_peers.values())
+        
+        # Если у нас недостаточно пиров, возвращаем все имеющиеся
+        if len(peers) <= count:
+            return peers
+            
+        # Выбираем случайные узлы
+        return random.sample(peers, count)
+    
+    def get_peer_count(self) -> int:
+        """
+        Возвращает количество известных пиров
+        
+        Returns:
+            int: Количество пиров
+        """
+        return len(self.known_peers) 

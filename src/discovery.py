@@ -430,3 +430,158 @@ class PeerDiscovery:
         except Exception as e:
             logger.error(f"Error removing peer: {e}")
             return False 
+    def get_peers(self, service: Optional[str] = None, min_reputation: float = 0.5) -> List[PeerInfo]:
+        """Get list of known peers with reputation filtering"""
+        current_time = time.time()
+        
+        if service:
+            # Проверяем кэш
+            cache_key = f"service:{service}:{min_reputation}"
+            if cache_key in self.discovery_cache:
+                cache_time, cached_peers = self.discovery_cache[cache_key]
+                if current_time - cache_time < self.cache_ttl:
+                    return cached_peers
+                    
+            # Получаем из индекса с фильтрацией по репутации
+            peers = [
+                peer for peer in self.service_peers.get(service, [])
+                if peer.reputation >= min_reputation
+            ]
+            # Кэшируем результат
+            self.discovery_cache[cache_key] = (current_time, peers)
+            return peers
+            
+        # Возвращаем всех пиров с достаточной репутацией
+        return [
+            peer for peer in self.known_peers.values()
+            if peer.reputation >= min_reputation
+        ]
+
+    def get_network_stats(self) -> Dict:
+        """Get network statistics"""
+        return {
+            "total_peers": len(self.known_peers),
+            "active_peers": len(self.active_peers),
+            "services": {
+                service: len(peers)
+                for service, peers in self.service_peers.items()
+            },
+            "reputation_stats": {
+                "high": len([p for p in self.known_peers.values() if p.reputation > 0.8]),
+                "medium": len([p for p in self.known_peers.values() if 0.5 <= p.reputation <= 0.8]),
+                "low": len([p for p in self.known_peers.values() if p.reputation < 0.5])
+            },
+            "error_counts": dict(self.error_counts)
+        }
+
+    async def _bootstrap(self):
+        """Connect to bootstrap nodes to get initial peers"""
+        tasks = []
+        for address, port in self.bootstrap_nodes:
+            tasks.append(self._bootstrap_node(address, port))
+            
+        await asyncio.gather(*tasks)
+                
+    async def _bootstrap_node(self, address: str, port: int):
+        """Bootstrap single node"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(5)
+            
+            start_time = time.time()
+            message = struct.pack("!20s", self.node_id.encode())
+            sock.sendto(message, (address, port))
+            
+            data, addr = sock.recvfrom(1024)
+            latency = time.time() - start_time
+            
+            peer = self._process_peer_response(data, addr)
+            if peer:
+                peer.latency = latency
+                
+        except Exception as e:
+            logger.error(f"Bootstrap failed for {address}:{port}: {e}")
+        finally:
+            sock.close()
+                
+    def _process_peer_response(self, data: bytes, addr: Tuple[str, int]) -> Optional[PeerInfo]:
+        """Process peer discovery response"""
+        try:
+            node_id = data[:20].hex()
+            public_key = data[20:52].hex()
+            services = struct.unpack("!I", data[52:56])[0]
+            port = struct.unpack("!H", data[56:58])[0]
+            
+            peer = PeerInfo(
+                node_id=node_id,
+                address=addr[0],
+                port=port,
+                public_key=public_key,
+                last_seen=time.time(),
+                services=set()
+            )
+            
+            if services & 0x01:
+                peer.services.add("chat")
+            if services & 0x02:
+                peer.services.add("storage")
+            if services & 0x04:
+                peer.services.add("relay")
+                
+            self.known_peers[node_id] = peer
+            self.active_peers.add(node_id)
+            
+            # Обновляем индекс по сервисам
+            for service in peer.services:
+                self.service_peers[service].append(peer)
+                
+            return peer
+            
+        except Exception as e:
+            logger.error(f"Error processing peer response: {e}")
+            return None
+            
+    async def _cleanup_peers(self):
+        """Remove inactive peers"""
+        current_time = time.time()
+        inactive_peers = [
+            node_id for node_id, peer in self.known_peers.items()
+            if current_time - peer.last_seen > 3600
+        ]
+        
+        for node_id in inactive_peers:
+            peer = self.known_peers[node_id]
+            # Удаляем из индекса сервисов
+            for service in peer.services:
+                self.service_peers[service].remove(peer)
+            del self.known_peers[node_id]
+            self.active_peers.discard(node_id)
+            
+    def add_peer(self, peer: PeerInfo) -> bool:
+        """Add a new peer manually"""
+        try:
+            self.known_peers[peer.node_id] = peer
+            self.active_peers.add(peer.node_id)
+            # Обновляем индекс сервисов
+            for service in peer.services:
+                self.service_peers[service].append(peer)
+            return True
+        except Exception as e:
+            logger.error(f"Error adding peer: {e}")
+            return False
+            
+    def remove_peer(self, node_id: str) -> bool:
+        """Remove a peer"""
+        try:
+            if node_id in self.known_peers:
+                peer = self.known_peers[node_id]
+                # Удаляем из индекса сервисов
+                for service in peer.services:
+                    self.service_peers[service].remove(peer)
+                del self.known_peers[node_id]
+                self.active_peers.discard(node_id)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error removing peer: {e}")
+            return False 

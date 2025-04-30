@@ -178,7 +178,7 @@ class P2PConnection:
         """Initialize any async resources"""
         pass  # Add async initialization if needed
 
-class P2PNetwork:
+class Network:
     """
     Реализует P2P-сеть для обмена сообщениями между узлами
     """
